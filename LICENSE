@@ -1,0 +1,21 @@
+nirs4all-tools is dual-licensed, consistent with the nirs4all ecosystem policy:
+
+    CeCILL-2.1 OR AGPL-3.0-or-later
+
+You may use, modify, and redistribute this software under the terms of either
+the CeCILL Free Software License Agreement v2.1 or the GNU Affero General Public
+License version 3 (or, at your option, any later version), at your choice.
+
+A separate commercial license is also available.
+
+Canonical license texts:
+  - CeCILL-2.1: https://cecill.info/licences/Licence_CeCILL_V2.1-en.html
+  - AGPL-3.0:   https://www.gnu.org/licenses/agpl-3.0.txt
+
+Copyright (c) CIRAD and the nirs4all authors.
+Contact: nirs4all-admin@cirad.fr
+
+NOTE (scaffold): this LICENSE summary mirrors the ecosystem policy recorded for
+the sibling repositories. The maintainer should drop in the full canonical
+CeCILL-2.1 and AGPL-3.0 license texts (as the other nirs4all repos ship them)
+before the first public release.

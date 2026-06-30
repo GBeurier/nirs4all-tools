@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nirs4all-tools"
+# Version is single-sourced from src/nirs4all_tools/__init__.py (__version__).
+dynamic = ["version"]
+description = "Offline, one-way, no-in-place migration tools for legacy nirs4all artifacts."
+authors = [
+    { name = "Gregory Beurier", email = "beurier@cirad.fr" },
+]
+maintainers = [
+    { name = "Gregory Beurier", email = "gregory.beurier@cirad.fr" },
+]
+readme = "README.md"
+license = { text = "CeCILL-2.1 OR AGPL-3.0-or-later" }
+keywords = ["nirs4all", "migration", "workspace", "legacy", "converter"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+requires-python = ">=3.11"
+# The scaffold core is pure standard library (argparse, sqlite3, zipfile,
+# hashlib, json). Format-specific readers live behind optional extras so the
+# base install stays minimal and the runtime library never inherits them.
+dependencies = []
+
+[project.optional-dependencies]
+# Required only to read a DuckDB-kind source.
+duckdb = ["duckdb>=1.0.0"]
+# Required only to read/validate Parquet sidecars.
+parquet = ["pyarrow>=14.0.0"]
+# Required only to author a real Phase-1 nirs4all-workspace-v2 target store
+# (create_schema / ArrayStore) once the transform engine lands.
+target = ["nirs4all>=0.10.0"]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+    "build>=1.0.0",
+]
+
+[project.scripts]
+nirs4all-tools = "nirs4all_tools.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/GBeurier/nirs4all-tools"
+Repository = "https://github.com/GBeurier/nirs4all-tools"
+Issues = "https://github.com/GBeurier/nirs4all-tools/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nirs4all_tools*"]
+
+[tool.setuptools.package-data]
+nirs4all_tools = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { attr = "nirs4all_tools.__version__" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/*" = ["B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/nirs4all_tools"]
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["nirs4all_tools"]
+omit = ["*/tests/*"]
