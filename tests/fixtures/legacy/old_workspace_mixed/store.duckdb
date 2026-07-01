@@ -1,1 +1,3 @@
-legacy duckdb workspace placeholder
+nirs4all-tools opaque duckdb sentinel
+format: not a DuckDB database
+claim: detection and byte preservation only

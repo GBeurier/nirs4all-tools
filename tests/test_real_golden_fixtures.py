@@ -1,4 +1,4 @@
-"""Golden fixture coverage for reduced real legacy converter payloads."""
+"""Golden fixture coverage for reduced legacy converter payloads."""
 
 from __future__ import annotations
 
@@ -41,6 +41,50 @@ def _assert_source_unchanged(source: Path, before: policy.TreeSnapshot) -> None:
 
 def _read_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_golden_mixed_workspace_fixture_labels_are_release_honest() -> None:
+    source = FIXTURES / "old_workspace_mixed"
+
+    duckdb_payload = (source / "store.duckdb").read_bytes()
+    assert duckdb_payload == (
+        b"nirs4all-tools opaque duckdb sentinel\n"
+        b"format: not a DuckDB database\n"
+        b"claim: detection and byte preservation only\n"
+    )
+
+    parquet_path = source / "sample.meta.parquet"
+    parquet_payload = parquet_path.read_bytes()
+    assert parquet_payload[:4] == b"PAR1"
+    assert parquet_payload[-4:] == b"PAR1"
+    assert b"placeholder" not in parquet_payload.lower()
+    assert 0 < int.from_bytes(parquet_payload[-8:-4], "little") < len(parquet_payload)
+
+    pq = pytest.importorskip("pyarrow.parquet")
+    rows = pq.read_table(parquet_path).to_pylist()
+    assert rows == [
+        {
+            "sample_id": "cassava-001",
+            "prediction_id": "pred-loose-001",
+            "dataset": "cassava-drymatter-2024",
+            "partition": "validation",
+            "row_index": 0,
+        },
+        {
+            "sample_id": "cassava-002",
+            "prediction_id": "pred-loose-001",
+            "dataset": "cassava-drymatter-2024",
+            "partition": "validation",
+            "row_index": 1,
+        },
+        {
+            "sample_id": "cassava-003",
+            "prediction_id": "pred-loose-001",
+            "dataset": "cassava-drymatter-2024",
+            "partition": "validation",
+            "row_index": 2,
+        },
+    ]
 
 
 def test_golden_legacy_workspace_dry_run_reports_unsupported_without_output(tmp_path: Path) -> None:
