@@ -166,6 +166,15 @@ def make_n4a_bundle(path: Path, *, bundle_format_version: str = "1.0") -> Path:
     return path
 
 
+def make_native_results_dir(root: Path, *, schema_version: int = 2) -> Path:
+    """Create a minimal native-results directory."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.json").write_text(json.dumps({"schema_version": schema_version}), encoding="utf-8")
+    (root / "score_set.json").write_text(json.dumps({"reports": []}), encoding="utf-8")
+    (root / "predictions.parquet").write_bytes(b"PAR1synthetic")
+    return root
+
+
 @pytest.fixture
 def sqlite_v2_workspace(tmp_path: Path) -> Path:
     return make_sqlite_workspace(tmp_path / "ws_v2", user_version=2)
@@ -189,3 +198,8 @@ def forward_version_workspace(tmp_path: Path) -> Path:
 @pytest.fixture
 def n4a_bundle(tmp_path: Path) -> Path:
     return make_n4a_bundle(tmp_path / "model.n4a", bundle_format_version="1.0")
+
+
+@pytest.fixture
+def native_results_dir(tmp_path: Path) -> Path:
+    return make_native_results_dir(tmp_path / "native-results")

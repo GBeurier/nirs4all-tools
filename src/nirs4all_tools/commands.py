@@ -50,6 +50,7 @@ _PAYLOAD_DIRNAME = "payload"
 _PRESERVED_DIRNAME = "preserved"
 _LEGACY_ARRAYS_JSONL = f"{_PRESERVED_DIRNAME}/legacy-prediction-arrays.jsonl"
 _LEGACY_ARRAY_COLUMNS = ("prediction_id", "y_true", "y_pred", "y_proba", "sample_indices", "weights")
+_OPAQUE_PRESERVABLE_KINDS = frozenset({KIND_NATIVE_RESULTS_V1, KIND_N4A_BUNDLE, KIND_N4A_PY_BUNDLE})
 
 
 def _now_iso() -> str:
@@ -275,6 +276,19 @@ def _copy_workspace_v2_tables(source: sqlite3.Connection, target: sqlite3.Connec
     return copied
 
 
+def _create_empty_workspace_v2_store(output: Path) -> tuple[Path, dict[str, int]]:
+    """Create an empty workspace-v2 store and return its row counts."""
+    target_store = output / "store.sqlite"
+    target = sqlite3.connect(target_store)
+    try:
+        create_workspace_v2_schema(target)
+        target.commit()
+        counts = _target_row_counts(target)
+    finally:
+        target.close()
+    return target_store, counts
+
+
 def _legacy_array_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Return legacy ``prediction_arrays`` rows as dictionaries."""
     if "prediction_arrays" not in _sqlite_tables(conn):
@@ -301,6 +315,42 @@ def _write_preserved_legacy_arrays(output: Path, rows: list[dict[str, Any]]) -> 
             checksums[f"arrays:{prediction_id}"] = sha256_bytes(payload.encode("utf-8"))
     checksums[_LEGACY_ARRAYS_JSONL] = sha256_file(preserved_path)
     return checksums
+
+
+def _artifact_source_path(input_path: Path, art: DetectedArtifact) -> Path:
+    """Resolve a detected artifact path against the source root/file."""
+    if art.path == ".":
+        return input_path
+    return input_path / art.path
+
+
+def _artifact_preserved_rel(input_path: Path, art: DetectedArtifact) -> str:
+    """Stable destination under ``preserved/`` for one opaque artifact."""
+    name = (input_path.name or "root") if art.path == "." else art.path
+    return f"{_PRESERVED_DIRNAME}/{art.source_kind}/{name}"
+
+
+def _copy_preserved_artifact(source: Path, dest: Path, rel_prefix: str) -> dict[str, str]:
+    """Copy one opaque artifact and return file-level checksums keyed by output path."""
+    checksums: dict[str, str] = {}
+    if source.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, dest)
+        checksums[rel_prefix] = sha256_file(dest)
+        return checksums
+
+    for src_file in sorted(path for path in source.rglob("*") if path.is_file()):
+        rel = src_file.relative_to(source).as_posix()
+        dst_file = dest / rel
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, dst_file)
+        checksums[f"{rel_prefix}/{rel}"] = sha256_file(dst_file)
+    return checksums
+
+
+def _preservable_opaque_artifacts(detection: DetectionResult) -> list[DetectedArtifact]:
+    """Return supported opaque artifacts that can be preserved in best-effort mode."""
+    return [art for art in detection.artifacts if art.source_kind in _OPAQUE_PRESERVABLE_KINDS]
 
 
 def _target_row_counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -434,6 +484,20 @@ def migrate(
             return _run_sqlite_legacy_arrays_transform(
                 input_path,
                 output,
+                manifest,
+                report,
+                manifest_path,
+                report_path,
+                id_map_path,
+                strict=strict,
+                verify_after=verify,
+            )
+        opaque_artifacts = _preservable_opaque_artifacts(detection)
+        if opaque_artifacts:
+            return _run_opaque_artifact_preservation(
+                input_path,
+                output,
+                opaque_artifacts,
                 manifest,
                 report,
                 manifest_path,
@@ -641,6 +705,122 @@ def _run_sqlite_legacy_arrays_transform(
             raise
     finally:
         source.close()
+
+
+def _run_opaque_artifact_preservation(
+    input_path: Path,
+    output: Path,
+    artifacts: list[DetectedArtifact],
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    *,
+    strict: bool,
+    verify_after: bool = False,
+) -> ExitCode:
+    """Preserve native results / bundle artifacts without executing legacy code."""
+    if strict:
+        names = ", ".join(f"{art.path}({art.source_kind})" for art in artifacts)
+        raise UnsupportedInput(
+            f"strict migration cannot lower opaque artifact(s) into workspace-v2 yet: {names}",
+            cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+            mitigation="rerun without --strict to preserve opaque artifacts with checksums, or use --copy-only",
+        )
+
+    created = not output.exists()
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        target_store, target_counts = _create_empty_workspace_v2_store(output)
+        checksums: dict[str, str] = {"store.sqlite": sha256_file(target_store)}
+        output_inventory = [
+            {
+                "path": "store.sqlite",
+                "tables": {table: {} for table in WORKSPACE_V2_TABLES},
+                "row_counts": target_counts,
+                "generated_manifests": [
+                    contracts.DEFAULT_MANIFEST_NAME,
+                    contracts.DEFAULT_REPORT_NAME,
+                    contracts.DEFAULT_ID_MAP_NAME,
+                ],
+            }
+        ]
+
+        for art in artifacts:
+            source = _artifact_source_path(input_path, art)
+            rel = _artifact_preserved_rel(input_path, art)
+            dest = output / rel
+            artifact_checksums = _copy_preserved_artifact(source, dest, rel)
+            checksums.update(artifact_checksums)
+            checksum = sha256_file(dest) if dest.is_file() else sha256_bytes(
+                json.dumps(artifact_checksums, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            )
+            manifest["preserved_opaque"].append(
+                {
+                    "path": rel,
+                    "reason": art.source_kind,
+                    "checksum": checksum,
+                }
+            )
+            manifest["unsupported"].append(
+                {
+                    "item": art.path,
+                    "source_kind": art.source_kind,
+                    "reason": "semantic lowering to workspace-v2 is not implemented in this slice",
+                    "disposition": "preserved",
+                }
+            )
+            output_inventory.append(
+                {
+                    "path": rel,
+                    "tables": {},
+                    "row_counts": {"files": len(artifact_checksums)},
+                    "generated_manifests": [],
+                }
+            )
+
+        manifest["checksums"] = checksums
+        manifest["output_inventory"] = output_inventory
+        manifest["warnings"].append(
+            "opaque native-results/bundle artifacts preserved with checksums; no runtime legacy reader is used"
+        )
+        manifest["tool"]["completed_at"] = _now_iso()
+
+        report["status"] = vocab.STATUS_MIGRATED_WITH_WARNINGS
+        report["target_summary"]["kind"] = vocab.TARGET_WORKSPACE_V2
+        report["migrated_counts"].update(
+            {
+                "runs": target_counts["runs"],
+                "pipelines": target_counts["pipelines"],
+                "chains": target_counts["chains"],
+                "predictions": target_counts["predictions"],
+                "artifacts": target_counts["artifacts"],
+                "arrays": 0,
+            }
+        )
+        report["preserved_counts"]["opaque_artifacts"] = len(artifacts)
+        report["unsupported_counts"]["preserved"] = len(artifacts)
+        report["warnings"].append(
+            "opaque native-results/bundle artifacts preserved; rerun a future tool release for semantic lowering"
+        )
+        report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+
+        if manifest_path is not None:
+            _write_json(manifest_path, manifest)
+        if verify_after:
+            exclude_names = {p.name for p in (manifest_path, report_path, id_map_path) if p is not None}
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            _raise_if_verification_failed(report["verification_summary"])
+        if report_path is not None:
+            _write_json(report_path, report)
+        if id_map_path is not None:
+            _write_json(id_map_path, manifest["old_to_new_ids"])
+        return ExitCode.MIGRATED_WITH_WARNINGS
+    except Exception:
+        if created and output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+        raise
 
 
 def _iter_output_files(output_dir: Path, exclude: set[str]) -> list[str]:
