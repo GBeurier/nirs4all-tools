@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from nirs4all_tools import commands, policy, vocab
+from nirs4all_tools.checksums import sha256_file
 from nirs4all_tools.errors import PolicyRefusal
 from nirs4all_tools.exit_codes import ExitCode
 
@@ -231,12 +232,55 @@ def test_golden_sqlite_legacy_arrays_lowers_metadata_and_preserves_rows(tmp_path
             ("field/block 7",),
         ]
 
-    preserved_rows = [
-        json.loads(line)
-        for line in (out / "preserved" / "legacy-prediction-arrays.jsonl").read_text(encoding="utf-8").splitlines()
+    preserved_arrays = out / "preserved" / "legacy-prediction-arrays.jsonl"
+    preserved_rows = [json.loads(line) for line in preserved_arrays.read_text(encoding="utf-8").splitlines()]
+    assert preserved_rows == [
+        {
+            "dataset_name": "corn-lot-2024",
+            "fold_id": "fold-1",
+            "metric": "rmse",
+            "model_name": "PLSRegression",
+            "partition": "validation",
+            "prediction_id": "pred-old-pls-val",
+            "sample_indices": "[101,102,103]",
+            "task_type": "regression",
+            "val_score": 0.12,
+            "weights": "[1.0,0.8,1.2]",
+            "y_pred": "[32.0,31.4,31.0]",
+            "y_proba": None,
+            "y_true": "[32.1,31.5,30.8]",
+        },
+        {
+            "dataset_name": "field/block 7",
+            "fold_id": "fold-2",
+            "metric": "accuracy",
+            "model_name": "SVC",
+            "partition": "test",
+            "prediction_id": "pred-old-svm-test",
+            "sample_indices": "[201,202,203,204]",
+            "task_type": "classification",
+            "val_score": 0.75,
+            "weights": None,
+            "y_pred": "[0,1,0,0]",
+            "y_proba": "[[0.9,0.1],[0.2,0.8],[0.6,0.4],[0.8,0.2]]",
+            "y_true": "[0,1,1,0]",
+        },
     ]
-    assert {row["prediction_id"] for row in preserved_rows} == {"pred-old-pls-val", "pred-old-svm-test"}
-    assert manifest["preserved_opaque"][0]["reason"] == "legacy_prediction_arrays"
+    assert sha256_file(preserved_arrays) == "sha256:2fd39c42493dd6583ff5458217dcae877c3cb0522f7719aa1e66019c90fef8b1"
+    assert manifest["checksums"]["arrays:pred-old-pls-val"] == (
+        "sha256:112438ce3dae9807dd717d768096e787419977c22e8dc5f1dd615bd8e2fd19d0"
+    )
+    assert manifest["checksums"]["arrays:pred-old-svm-test"] == (
+        "sha256:b61c6a80f92c43fb43322ca71ef0a0dcba8b4e30e8e33c7b34f49e1f0cd38cd3"
+    )
+    assert manifest["checksums"]["preserved/legacy-prediction-arrays.jsonl"] == sha256_file(preserved_arrays)
+    assert manifest["preserved_opaque"] == [
+        {
+            "path": "preserved/legacy-prediction-arrays.jsonl",
+            "reason": "legacy_prediction_arrays",
+            "checksum": manifest["checksums"]["preserved/legacy-prediction-arrays.jsonl"],
+        }
+    ]
 
     pls_rows = pq.read_table(out / "arrays" / "corn-lot-2024.parquet").to_pylist()
     svm_rows = pq.read_table(out / "arrays" / "field_block_7.parquet").to_pylist()
