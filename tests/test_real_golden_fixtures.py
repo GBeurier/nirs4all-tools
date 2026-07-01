@@ -11,7 +11,7 @@ import pytest
 
 from nirs4all_tools import commands, policy, vocab
 from nirs4all_tools.checksums import sha256_file
-from nirs4all_tools.errors import PolicyRefusal
+from nirs4all_tools.errors import PolicyRefusal, UnsupportedInput
 from nirs4all_tools.exit_codes import ExitCode
 
 FIXTURES = Path(__file__).parent / "fixtures" / "legacy"
@@ -34,6 +34,15 @@ def _materialize_sqlite_fixture(sql_name: str, tmp_path: Path) -> Path:
     finally:
         con.close()
     return root
+
+
+def _copy_standalone_loose_fixture(tmp_path: Path) -> Path:
+    source = FIXTURES / "old_workspace_mixed"
+    target = tmp_path / "standalone_loose_predictions"
+    target.mkdir()
+    shutil.copy2(source / "run_predictions.json", target / "run_predictions.json")
+    shutil.copy2(source / "sample.meta.parquet", target / "sample.meta.parquet")
+    return target
 
 
 def _assert_source_unchanged(source: Path, before: policy.TreeSnapshot) -> None:
@@ -163,6 +172,185 @@ def test_golden_legacy_workspace_preserves_payloads_with_reports_and_verify(tmp_
     assert (preserved_loose / "sample.meta.parquet").read_bytes() == (source / "sample.meta.parquet").read_bytes()
     assert "preserved/duckdb-workspace/store.duckdb" in manifest["checksums"]
     assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
+
+
+def test_golden_standalone_loose_predictions_lowers_and_preserves_payload(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    import pyarrow.parquet as pq
+
+    source = _copy_standalone_loose_fixture(tmp_path)
+    out = tmp_path / "out"
+    before = policy.snapshot_tree(source)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        strict=True,
+        verify=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.SUCCESS
+    _assert_source_unchanged(source, before)
+
+    manifest = _read_json(out / "migration-manifest.json")
+    report = _read_json(out / "migration-report.json")
+    unsupported = _read_json(out / "unsupported-report.json")
+    preserved = out / "preserved" / "loose-predictions" / source.name
+
+    assert manifest["unsupported"] == []
+    assert unsupported["counts"]["unsupported"] == 0
+    assert report["migrated_counts"]["runs"] == 1
+    assert report["migrated_counts"]["pipelines"] == 1
+    assert report["migrated_counts"]["chains"] == 1
+    assert report["migrated_counts"]["predictions"] == 1
+    assert report["migrated_counts"]["arrays"] == 1
+    assert report["target_summary"]["preview"]["source_payload_preserved"] == (
+        f"preserved/loose-predictions/{source.name}"
+    )
+    assert report["verification_summary"]["checks"]["array_checksum_coverage"]["status"] == "passed"
+
+    assert (preserved / "run_predictions.json").read_text(encoding="utf-8") == (
+        source / "run_predictions.json"
+    ).read_text(encoding="utf-8")
+    assert (preserved / "sample.meta.parquet").read_bytes() == (source / "sample.meta.parquet").read_bytes()
+    assert f"preserved/loose-predictions/{source.name}/run_predictions.json" in manifest["checksums"]
+    assert f"preserved/loose-predictions/{source.name}/sample.meta.parquet" in manifest["checksums"]
+
+    with sqlite3.connect(out / "store.sqlite") as con:
+        row = con.execute(
+            """
+            SELECT pl.run_id, p.dataset_name, p.model_name, p.model_class, p.fold_id,
+                   p.partition, p.metric, p.task_type, p.n_samples
+            FROM predictions p
+            JOIN pipelines pl ON p.pipeline_id = pl.pipeline_id
+            """
+        ).fetchone()
+        assert row == (
+            "run-2024-legacy",
+            "cassava-drymatter-2024",
+            "PLSRegression",
+            "sklearn.cross_decomposition.PLSRegression",
+            "fold-0",
+            "validation",
+            "rmse",
+            "regression",
+            3,
+        )
+
+    rows = pq.read_table(out / "arrays" / "cassava-drymatter-2024.parquet").to_pylist()
+    prediction_id = rows[0]["prediction_id"]
+    assert prediction_id == "pred-loose-001"
+    assert manifest["checksums"][f"arrays:{prediction_id}"].startswith("sha256:")
+    assert rows[0]["sample_indices"] == [0, 1, 2]
+    assert rows[0]["y_true"] == [31.2, 29.8, 33.5]
+    assert rows[0]["y_pred"] == [31.0, 30.1, 33.0]
+    assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
+
+
+def test_golden_standalone_loose_predictions_strict_refuses_incomplete_json(tmp_path: Path) -> None:
+    source = tmp_path / "loose-bad"
+    source.mkdir()
+    (source / "run_predictions.json").write_text('{"run_id": "run-missing-fields"}\n', encoding="utf-8")
+    out = tmp_path / "out"
+    before = policy.snapshot_tree(source)
+
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            tool_version="0.0.1",
+        )
+
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "loose-predictions preview missing field(s)" in exc.value.message
+    assert not out.exists()
+    _assert_source_unchanged(source, before)
+
+
+def test_golden_standalone_loose_predictions_dry_run_reports_missing_parquet_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _copy_standalone_loose_fixture(tmp_path)
+    out = tmp_path / "out"
+    unsupported_path = tmp_path / "unsupported.json"
+    before = policy.snapshot_tree(source)
+    monkeypatch.setattr(commands, "_pyarrow_runtime_array_schema", lambda: None)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        unsupported_report_path=unsupported_path,
+        dry_run=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.SUCCESS
+    assert not out.exists()
+    _assert_source_unchanged(source, before)
+    unsupported = _read_json(unsupported_path)
+    assert unsupported["counts"] == {"unsupported": 1, "preserved": 1, "refused": 0, "opaque_payloads": 0}
+    assert unsupported["unsupported"][0]["source_kind"] == "loose-predictions"
+    assert unsupported["unsupported"][0]["disposition"] == "would_preserve"
+    assert unsupported["unsupported"][0]["cause"] == vocab.CAUSE_UNSUPPORTED_CAPABILITY
+    assert "pyarrow" in unsupported["unsupported"][0]["reason"]
+
+
+def test_golden_standalone_loose_predictions_missing_parquet_best_effort_preserves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _copy_standalone_loose_fixture(tmp_path)
+    out = tmp_path / "out"
+    before = policy.snapshot_tree(source)
+    monkeypatch.setattr(commands, "_pyarrow_runtime_array_schema", lambda: None)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        verify=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.MIGRATED_WITH_WARNINGS
+    _assert_source_unchanged(source, before)
+    manifest = _read_json(out / "migration-manifest.json")
+    report = _read_json(out / "migration-report.json")
+    unsupported = _read_json(out / "unsupported-report.json")
+    preserved = out / "preserved" / "loose-predictions" / source.name
+    assert not (out / "arrays").exists()
+    assert (preserved / "run_predictions.json").exists()
+    assert unsupported["unsupported"] == manifest["unsupported"]
+    assert manifest["unsupported"][0]["cause"] == vocab.CAUSE_UNSUPPORTED_CAPABILITY
+    assert "pyarrow" in manifest["unsupported"][0]["reason"]
+    assert report["verification_summary"]["passed"] is True
+
+
+def test_golden_standalone_loose_predictions_missing_parquet_strict_refuses_without_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _copy_standalone_loose_fixture(tmp_path)
+    out = tmp_path / "out"
+    before = policy.snapshot_tree(source)
+    monkeypatch.setattr(commands, "_pyarrow_runtime_array_schema", lambda: None)
+
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            tool_version="0.0.1",
+        )
+
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_CAPABILITY
+    assert "pyarrow" in exc.value.message
+    assert not out.exists()
+    _assert_source_unchanged(source, before)
 
 
 def test_golden_legacy_workspace_resume_requires_opt_in_and_verifies(tmp_path: Path) -> None:

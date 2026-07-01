@@ -73,10 +73,15 @@ Current schema-transform support is intentionally narrow:
 - malformed, older, mixed, or multi-artifact `native-results-v1` sources fail
   `--strict` with a machine-checkable schema/preflight cause, and best-effort
   mode preserves them opaque with the same reason in the manifest;
+- one standalone complete `*_predictions.json` loose-prediction payload is
+  lowered to workspace-v2 run/pipeline/chain/prediction metadata plus
+  runtime-readable `arrays/<dataset>.parquet` sidecars when the `parquet` extra
+  is installed; the original loose JSON and sibling metadata files are still
+  checksummed under `preserved/loose-predictions/`;
 - `.n4a`, `.n4a.py`, and non-lowerable `native-results-v1` artifacts are preserved as opaque
   checksummed payloads under `preserved/` with an empty workspace-v2 store;
 - non-lowerable legacy workspace payloads such as `store.duckdb`, legacy
-  `runs/` trees, loose prediction files, and already-v2 SQLite stores are also
+  `runs/` trees, incomplete or mixed loose prediction files, and already-v2 SQLite stores are also
   preserved opaque by default in best-effort mode; `--strict` refuses them
   before writing;
 - every real migration writes `unsupported-report.json` alongside the manifest,

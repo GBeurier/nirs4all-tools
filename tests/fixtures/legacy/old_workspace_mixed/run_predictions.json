@@ -3,8 +3,15 @@
   "pipeline_id": "pipeline-pls",
   "prediction_id": "pred-loose-001",
   "dataset": "cassava-drymatter-2024",
+  "model_name": "PLSRegression",
+  "model_class": "sklearn.cross_decomposition.PLSRegression",
+  "fold_id": "fold-0",
   "partition": "validation",
   "metric": "rmse",
+  "task_type": "regression",
+  "sample_indices": [0, 1, 2],
+  "preprocessing": ["SNV", "SavitzkyGolay"],
+  "val_score": 0.42,
   "y_true": [31.2, 29.8, 33.5],
   "y_pred": [31.0, 30.1, 33.0]
 }

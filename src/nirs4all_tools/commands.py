@@ -37,6 +37,12 @@ from .detect import (
 )
 from .errors import UnsupportedInput, VerificationFailed
 from .exit_codes import ExitCode
+from .loose_predictions import (
+    LoosePredictionsPreview,
+    load_loose_predictions_preview,
+    lower_loose_predictions_preview,
+    runtime_array_records_from_loose_predictions,
+)
 from .native_results import (
     NativeResultsPreview,
     load_native_results_preview,
@@ -553,6 +559,17 @@ def _pyarrow_runtime_array_schema() -> tuple[Any, Any, Any] | None:
     return pa, pq, schema
 
 
+def _runtime_array_sidecar_unavailable() -> UnsupportedInput:
+    return UnsupportedInput(
+        "runtime Parquet array sidecar lowering requires the optional pyarrow dependency",
+        cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+        mitigation=(
+            'install nirs4all-tools with the "parquet" extra, '
+            "or rerun without --strict for opaque preservation"
+        ),
+    )
+
+
 def _runtime_array_record_checksum(record: dict[str, Any]) -> str:
     payload = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return sha256_bytes(payload.encode("utf-8"))
@@ -565,14 +582,7 @@ def _write_runtime_array_records(
     """Write normalized runtime array records to Parquet sidecars."""
     arrow = _pyarrow_runtime_array_schema()
     if arrow is None:
-        raise UnsupportedInput(
-            "runtime Parquet array sidecar lowering requires the optional pyarrow dependency",
-            cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
-            mitigation=(
-                'install nirs4all-tools with the "parquet" extra, '
-                "or rerun without --strict for opaque preservation"
-            ),
-        )
+        raise _runtime_array_sidecar_unavailable()
     pa, pq, schema = arrow
 
     for record in records:
@@ -761,9 +771,30 @@ def _dry_run_unsupported_items(input_path: Path, detection: DetectionResult) -> 
     unsupported: list[dict[str, Any]] = []
     native_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_NATIVE_RESULTS_V1]
     standalone_native = len(native_artifacts) == 1 and len(detection.artifacts) == 1
+    loose_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_LOOSE_PREDICTIONS]
+    standalone_loose = len(loose_artifacts) == 1 and len(detection.artifacts) == 1
 
     for art in detection.artifacts:
         if art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS:
+            continue
+        if art.source_kind == KIND_LOOSE_PREDICTIONS and standalone_loose:
+            files = art.details.get("files")
+            try:
+                load_loose_predictions_preview(
+                    input_path,
+                    [str(item) for item in files] if isinstance(files, list) else [],
+                )
+                if _pyarrow_runtime_array_schema() is None:
+                    raise _runtime_array_sidecar_unavailable()
+            except UnsupportedInput as exc:
+                unsupported.append(
+                    _unsupported_entry(
+                        art,
+                        reason=exc.message,
+                        disposition="would_preserve",
+                        cause=exc.cause,
+                    )
+                )
             continue
         if art.source_kind == KIND_NATIVE_RESULTS_V1 and standalone_native:
             try:
@@ -992,6 +1023,75 @@ def migrate(
                     f"native-results-v1 lowering preview supports exactly one standalone artifact, got: {names}",
                     cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
                     mitigation="rerun without --strict to preserve mixed native artifacts opaque",
+                )
+        loose_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_LOOSE_PREDICTIONS]
+        if loose_artifacts:
+            if len(loose_artifacts) == 1 and len(detection.artifacts) == 1:
+                loose_artifact = loose_artifacts[0]
+                files = loose_artifact.details.get("files")
+                try:
+                    loose_preview = load_loose_predictions_preview(
+                        input_path,
+                        [str(item) for item in files] if isinstance(files, list) else [],
+                    )
+                except UnsupportedInput as exc:
+                    if strict:
+                        raise
+                    return _run_opaque_artifact_preservation(
+                        input_path,
+                        output,
+                        loose_artifacts,
+                        manifest,
+                        report,
+                        manifest_path,
+                        report_path,
+                        id_map_path,
+                        unsupported_report_path,
+                        strict=False,
+                        verify_after=verify,
+                        unsupported_reason=exc.message,
+                        unsupported_cause=exc.cause,
+                    )
+                missing_sidecar_writer = (
+                    _runtime_array_sidecar_unavailable() if _pyarrow_runtime_array_schema() is None else None
+                )
+                if missing_sidecar_writer is not None:
+                    if strict:
+                        raise missing_sidecar_writer
+                    return _run_opaque_artifact_preservation(
+                        input_path,
+                        output,
+                        loose_artifacts,
+                        manifest,
+                        report,
+                        manifest_path,
+                        report_path,
+                        id_map_path,
+                        unsupported_report_path,
+                        strict=False,
+                        verify_after=verify,
+                        unsupported_reason=missing_sidecar_writer.message,
+                        unsupported_cause=missing_sidecar_writer.cause,
+                    )
+                return _run_loose_predictions_preview_transform(
+                    input_path,
+                    output,
+                    loose_artifact,
+                    loose_preview,
+                    manifest,
+                    report,
+                    manifest_path,
+                    report_path,
+                    id_map_path,
+                    unsupported_report_path,
+                    verify_after=verify,
+                )
+            if strict:
+                names = ", ".join(f"{art.path}({art.source_kind})" for art in loose_artifacts)
+                raise UnsupportedInput(
+                    f"loose-predictions lowering preview supports exactly one standalone artifact, got: {names}",
+                    cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+                    mitigation="rerun without --strict to preserve mixed loose prediction artifacts opaque",
                 )
         opaque_artifacts = _preservable_opaque_artifacts(detection)
         if opaque_artifacts:
@@ -1343,6 +1443,101 @@ def _run_native_results_preview_transform(
             }
         )
         report["preserved_counts"]["native_payloads"] = 1
+        report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+
+        if manifest_path is not None:
+            _write_json(manifest_path, manifest)
+        _write_unsupported_report(
+            unsupported_report_path,
+            manifest=manifest,
+            report=report,
+            target_path=output,
+        )
+        if verify_after:
+            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            _raise_if_verification_failed(report["verification_summary"])
+        if report_path is not None:
+            _write_json(report_path, report)
+        if id_map_path is not None:
+            _write_json(id_map_path, manifest["old_to_new_ids"])
+        return ExitCode.SUCCESS
+    except Exception:
+        if created and output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+        raise
+
+
+def _run_loose_predictions_preview_transform(
+    input_path: Path,
+    output: Path,
+    artifact: DetectedArtifact,
+    preview: LoosePredictionsPreview,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    unsupported_report_path: Path | None,
+    *,
+    verify_after: bool = False,
+) -> ExitCode:
+    """Lower one validated standalone loose prediction payload to workspace-v2 output."""
+    created = not output.exists()
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        target_store = output / "store.sqlite"
+        target = sqlite3.connect(target_store)
+        try:
+            create_workspace_v2_schema(target)
+            lower_loose_predictions_preview(target, preview)
+            target.commit()
+            target_counts = _target_row_counts(target)
+        finally:
+            target.close()
+
+        rel, artifact_checksums = _copy_preserved_detected_artifact(input_path, output, artifact)
+        array_records = runtime_array_records_from_loose_predictions(preview)
+        runtime_array_checksums, runtime_array_inventory = _write_runtime_array_records(output, array_records)
+        checksums = {"store.sqlite": sha256_file(target_store), **runtime_array_checksums, **artifact_checksums}
+
+        manifest["checksums"] = checksums
+        manifest["output_inventory"] = [
+            {
+                "path": "store.sqlite",
+                "tables": {table: {} for table in WORKSPACE_V2_TABLES},
+                "row_counts": target_counts,
+                "generated_manifests": _generated_contract_names(),
+            },
+            *runtime_array_inventory,
+            {
+                "path": rel,
+                "tables": {},
+                "row_counts": {"files": len(artifact_checksums)},
+                "generated_manifests": [],
+            },
+        ]
+        manifest["tool"]["completed_at"] = _now_iso()
+
+        report["status"] = vocab.STATUS_SUCCESS
+        report["source_summary"]["row_counts"] = {"loose_prediction_rows": 1}
+        report["target_summary"]["kind"] = vocab.TARGET_WORKSPACE_V2
+        report["target_summary"]["preview"] = {
+            "loose_predictions_metadata_only": False,
+            "loose_predictions_array_sidecars": bool(array_records),
+            "source_payload_preserved": rel,
+        }
+        report["migrated_counts"].update(
+            {
+                "runs": target_counts["runs"],
+                "pipelines": target_counts["pipelines"],
+                "chains": target_counts["chains"],
+                "predictions": target_counts["predictions"],
+                "artifacts": target_counts["artifacts"],
+                "arrays": len(array_records),
+            }
+        )
+        report["preserved_counts"]["loose_prediction_payloads"] = 1
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
 
         if manifest_path is not None:
