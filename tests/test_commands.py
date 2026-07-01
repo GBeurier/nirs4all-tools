@@ -763,6 +763,204 @@ def test_verify_detects_orphan_file(sqlite_v2_workspace: Path, tmp_path: Path) -
         commands.verify(out, manifest_path=out / "migration-manifest.json")
 
 
+def test_verify_detects_preserved_opaque_file_checksum_mismatch(
+    n4a_bundle: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        n4a_bundle,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    preserved_path = manifest["preserved_opaque"][0]["path"]
+    manifest["preserved_opaque"][0]["checksum"] = "sha256:" + ("0" * 64)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["preserved_payload_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["mismatched_payloads"] == [preserved_path]
+
+
+def test_verify_detects_preserved_opaque_directory_checksum_mismatch(
+    legacy_workspace_inputs: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        legacy_workspace_inputs,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    preserved = next(item for item in manifest["preserved_opaque"] if item["path"].endswith("/runs"))
+    preserved["checksum"] = "sha256:" + ("0" * 64)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["preserved_payload_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["mismatched_payloads"] == [preserved["path"]]
+
+
+def test_verify_requires_preserved_opaque_ledger_when_opaque_payloads_exist(
+    n4a_bundle: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        n4a_bundle,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    unsupported_preserved = sum(
+        1 for item in manifest["unsupported"] if item["disposition"] == "preserved"
+    )
+    assert unsupported_preserved > 0
+    manifest["preserved_opaque"] = []
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["preserved_payload_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["missing_opaque_payloads"] == unsupported_preserved
+
+
+def test_verify_requires_preserved_opaque_key_when_opaque_payloads_exist(
+    n4a_bundle: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        n4a_bundle,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    unsupported_preserved = sum(
+        1 for item in manifest["unsupported"] if item["disposition"] == "preserved"
+    )
+    del manifest["preserved_opaque"]
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["preserved_payload_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["missing_opaque_payloads"] == unsupported_preserved
+
+
+def test_verify_rejects_invalid_preserved_opaque_ledger(
+    n4a_bundle: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        n4a_bundle,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["preserved_opaque"] = {}
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["preserved_payload_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["invalid_entries"] == ["<preserved_opaque>"]
+
+
+def test_verify_rejects_duplicate_preserved_opaque_paths(
+    n4a_bundle: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        n4a_bundle,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["preserved_opaque"].append(dict(manifest["preserved_opaque"][0]))
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["preserved_payload_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["duplicate_paths"] == [manifest["preserved_opaque"][0]["path"]]
+
+
+def test_verify_rejects_preserved_opaque_paths_outside_preserved(
+    n4a_bundle: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        n4a_bundle,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["preserved_opaque"][0]["path"] = "payload/not-preserved"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["preserved_payload_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["outside_preserved"] == ["payload/not-preserved"]
+
+
 def test_verify_detects_array_row_checksum_mismatch(
     sqlite_legacy_arrays_workspace: Path, tmp_path: Path
 ) -> None:

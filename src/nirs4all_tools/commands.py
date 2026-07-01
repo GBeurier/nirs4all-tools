@@ -1798,6 +1798,107 @@ def _array_checksum_verification(
     return check
 
 
+def _preserved_payload_verification(
+    manifest: dict[str, Any],
+    file_entries: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify preserved opaque payload ledger entries against file checksums."""
+    raw_preserved = manifest.get("preserved_opaque", [])
+    unsupported = manifest.get("unsupported", [])
+    unsupported_preserved = (
+        sum(
+            1
+            for item in unsupported
+            if isinstance(item, dict) and item.get("disposition") == "preserved"
+        )
+        if isinstance(unsupported, list)
+        else 0
+    )
+    output_inventory = manifest.get("output_inventory", [])
+    preserved_inventory_paths = (
+        sorted(
+            item["path"]
+            for item in output_inventory
+            if isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and item["path"].startswith(f"{_PRESERVED_DIRNAME}/")
+        )
+        if isinstance(output_inventory, list)
+        else []
+    )
+    preserved_file_entries = sorted(rel for rel in file_entries if rel.startswith(f"{_PRESERVED_DIRNAME}/"))
+    check: dict[str, Any] = {
+        "status": "not_applicable",
+        "payloads": len(raw_preserved) if isinstance(raw_preserved, list) else 0,
+        "unsupported_preserved": unsupported_preserved,
+        "preserved_file_entries": len(preserved_file_entries),
+        "preserved_inventory_paths": preserved_inventory_paths,
+        "missing_opaque_payloads": 0,
+        "missing_checksums": [],
+        "mismatched_payloads": [],
+        "duplicate_paths": [],
+        "invalid_entries": [],
+        "outside_preserved": [],
+        "failure_count": 0,
+    }
+    if not isinstance(raw_preserved, list):
+        check["invalid_entries"].append("<preserved_opaque>")
+        check["failure_count"] = 1
+        check["status"] = "failed"
+        return check
+    preserved = raw_preserved
+    if not preserved:
+        if unsupported_preserved:
+            check["missing_opaque_payloads"] = unsupported_preserved
+            check["failure_count"] = unsupported_preserved
+            check["status"] = "failed"
+        return check
+
+    seen: set[str] = set()
+    for index, item in enumerate(preserved):
+        if not isinstance(item, dict):
+            check["invalid_entries"].append(f"[{index}]")
+            continue
+        path = item.get("path")
+        checksum = item.get("checksum")
+        if not isinstance(path, str) or not path or not isinstance(checksum, str) or not checksum:
+            check["invalid_entries"].append(f"[{index}]")
+            continue
+        if path in seen:
+            check["duplicate_paths"].append(path)
+            continue
+        seen.add(path)
+        path_obj = Path(path)
+        if path_obj.is_absolute() or ".." in path_obj.parts or not path.startswith(f"{_PRESERVED_DIRNAME}/"):
+            check["outside_preserved"].append(path)
+            continue
+        if path in file_entries:
+            if file_entries[path] != checksum:
+                check["mismatched_payloads"].append(path)
+            continue
+        child_checksums = {
+            rel: digest for rel, digest in file_entries.items() if rel.startswith(f"{path}/")
+        }
+        if not child_checksums:
+            check["missing_checksums"].append(path)
+            continue
+        aggregate = sha256_bytes(json.dumps(child_checksums, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        if aggregate != checksum:
+            check["mismatched_payloads"].append(path)
+
+    check["missing_opaque_payloads"] = max(0, unsupported_preserved - len(preserved))
+    check["failure_count"] = (
+        check["missing_opaque_payloads"]
+        + len(check["missing_checksums"])
+        + len(check["mismatched_payloads"])
+        + len(check["duplicate_paths"])
+        + len(check["invalid_entries"])
+        + len(check["outside_preserved"])
+    )
+    check["status"] = "passed" if check["failure_count"] == 0 else "failed"
+    return check
+
+
 def _verification_summary_from_manifest(
     output_dir: Path, manifest: dict[str, Any], exclude_names: set[str] | None = None
 ) -> dict[str, Any]:
@@ -1826,6 +1927,7 @@ def _verification_summary_from_manifest(
     orphans = [rel for rel in _iter_output_files(output_dir, exclude) if rel not in file_entries]
     sqlite_check, prediction_ids = _sqlite_workspace_v2_verification(output_dir, file_entries)
     array_check = _array_checksum_verification(output_dir, checksums, file_entries, prediction_ids)
+    preserved_check = _preserved_payload_verification(manifest, file_entries)
 
     checks = {
         "manifest_checksums_present": len(file_entries),
@@ -1834,6 +1936,7 @@ def _verification_summary_from_manifest(
         "orphan_files": orphans,
         "sqlite_integrity_check": sqlite_check,
         "array_checksum_coverage": array_check,
+        "preserved_payload_coverage": preserved_check,
     }
     mismatches = (
         len(missing)
@@ -1841,6 +1944,7 @@ def _verification_summary_from_manifest(
         + len(orphans)
         + len(sqlite_check["errors"])
         + int(array_check["failure_count"])
+        + int(preserved_check["failure_count"])
     )
     passed = mismatches == 0
     return {
@@ -1857,13 +1961,15 @@ def _raise_if_verification_failed(summary: dict[str, Any]) -> None:
     checks = summary["checks"]
     sqlite_failures = len(checks["sqlite_integrity_check"]["errors"])
     array_failures = int(checks["array_checksum_coverage"]["failure_count"])
+    preserved_failures = int(checks["preserved_payload_coverage"]["failure_count"])
     raise VerificationFailed(
         "verification failed: "
         f"{len(checks['missing_files'])} missing, "
         f"{len(checks['mismatched_files'])} mismatched, "
         f"{len(checks['orphan_files'])} orphan file(s), "
         f"{sqlite_failures} sqlite failure(s), "
-        f"{array_failures} array failure(s)",
+        f"{array_failures} array failure(s), "
+        f"{preserved_failures} preserved payload failure(s)",
         cause=vocab.CAUSE_VERIFICATION_FAILED,
         mitigation="re-run the migration; the output does not match its manifest",
     )
@@ -1874,8 +1980,8 @@ def verify(output_dir: Path, *, manifest_path: Path, report_path: Path | None = 
 
     Implements the manifest-self-consistency checks: every file-level checksum
     entry must match a real file, and every output file must have a checksum
-    entry. SQLite/array-level checks require the transform output and are
-    reported as ``skipped`` in this scaffold.
+    entry. Workspace-v2 SQLite integrity, runtime array row checksums, and
+    preserved opaque payload ledger entries are checked when present.
     """
     try:
         manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
