@@ -6,6 +6,7 @@ safety machinery must work with nothing but stat + read-only parse.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import zipfile
@@ -175,6 +176,116 @@ def make_native_results_dir(root: Path, *, schema_version: int = 2) -> Path:
     return root
 
 
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def make_lowerable_native_results_dir(root: Path, *, schema_version: int = 3) -> Path:
+    """Create a current-shape native-results directory with a real parquet projection."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root.mkdir(parents=True, exist_ok=True)
+    score_set = {
+        "plan_id": "plan-1",
+        "bundle_id": "bundle-1",
+        "reports": [
+            {
+                "producer_node": "node:pls",
+                "partition": "val",
+                "fold_id": "fold-0",
+                "metric": "rmse",
+                "value": 0.1,
+            }
+        ],
+    }
+    score_hash = hashlib.sha256(_canonical_json(score_set).encode("utf-8")).hexdigest()
+    manifest = {
+        "schema_version": schema_version,
+        "run_id": "run-native-1",
+        "created_at": "2026-07-01T00:00:00+00:00",
+        "engine": "dag-ml",
+        "nirs4all_version": "0.0.test",
+        "dag_ml_version": "0.0.test",
+        "datasets": ["dataset-a"],
+        "config_names": ["config-a"],
+        "variant_names": ["config-a"],
+        "model_names": ["PLSRegression"],
+        "metric": "rmse",
+        "task_type": "regression",
+        "selected_variant": "config-a",
+        "plan_id": "plan-1",
+        "bundle_id": "bundle-1",
+        "producer_nodes": ["node:pls"],
+        "final_producer_nodes": [],
+        "num_predictions": 1,
+        "score_set_hash": score_hash,
+        "capabilities": {"has_model_artifacts": False, "has_aggregate_predictions": False},
+        "artifacts": [],
+        "files": {"score_set": "score_set.json", "predictions": "predictions.parquet"},
+    }
+    rows = [
+        {
+            "dataset": "dataset-a",
+            "config_name": "config-a",
+            "variant_id": "config-a",
+            "model_name": "PLSRegression",
+            "partition": "val",
+            "fold_id": "fold-0",
+            "refit_context": "",
+            "sample_indices": [0, 1, 2],
+            "y_true": [1.0, 2.0, 3.0],
+            "y_pred": [1.1, 1.9, 3.2],
+            "y_proba": [],
+            "y_true_shape": [3],
+            "y_pred_shape": [3],
+            "y_proba_shape": [],
+            "weights": [],
+            "arrays_present": True,
+            "val_score": 0.1,
+            "test_score": 0.2,
+            "train_score": 0.05,
+            "scores": '{"val":{"rmse":0.1}}',
+            "metric": "rmse",
+            "task_type": "regression",
+            "target_width": 1,
+            "target_names": '["y"]',
+        }
+    ]
+    schema = pa.schema(
+        [
+            ("dataset", pa.utf8()),
+            ("config_name", pa.utf8()),
+            ("variant_id", pa.utf8()),
+            ("model_name", pa.utf8()),
+            ("partition", pa.utf8()),
+            ("fold_id", pa.utf8()),
+            ("refit_context", pa.utf8()),
+            ("sample_indices", pa.list_(pa.int64())),
+            ("y_true", pa.list_(pa.float64())),
+            ("y_pred", pa.list_(pa.float64())),
+            ("y_proba", pa.list_(pa.float64())),
+            ("y_true_shape", pa.list_(pa.int64())),
+            ("y_pred_shape", pa.list_(pa.int64())),
+            ("y_proba_shape", pa.list_(pa.int64())),
+            ("weights", pa.list_(pa.float64())),
+            ("arrays_present", pa.bool_()),
+            ("val_score", pa.float64()),
+            ("test_score", pa.float64()),
+            ("train_score", pa.float64()),
+            ("scores", pa.utf8()),
+            ("metric", pa.utf8()),
+            ("task_type", pa.utf8()),
+            ("target_width", pa.int64()),
+            ("target_names", pa.utf8()),
+        ]
+    )
+    (root / "score_set.json").write_text(_canonical_json(score_set), encoding="utf-8")
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    pq.write_table(pa.Table.from_pylist(rows, schema=schema), root / "predictions.parquet")
+    return root
+
+
 @pytest.fixture
 def sqlite_v2_workspace(tmp_path: Path) -> Path:
     return make_sqlite_workspace(tmp_path / "ws_v2", user_version=2)
@@ -203,3 +314,8 @@ def n4a_bundle(tmp_path: Path) -> Path:
 @pytest.fixture
 def native_results_dir(tmp_path: Path) -> Path:
     return make_native_results_dir(tmp_path / "native-results")
+
+
+@pytest.fixture
+def lowerable_native_results_dir(tmp_path: Path) -> Path:
+    return make_lowerable_native_results_dir(tmp_path / "native-results")

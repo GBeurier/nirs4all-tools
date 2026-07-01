@@ -57,6 +57,15 @@ def test_detect_forward_n4a_bundle(tmp_path: Path) -> None:
     assert art.supported is False
 
 
+def test_detect_current_native_results(lowerable_native_results_dir: Path) -> None:
+    result = detect.detect_sources(lowerable_native_results_dir)
+    assert detect.KIND_NATIVE_RESULTS_V1 in result.kinds
+    art = next(a for a in result.artifacts if a.source_kind == detect.KIND_NATIVE_RESULTS_V1)
+    assert art.detected_version == 3
+    assert art.forward_version is False
+    assert art.supported is True
+
+
 def test_detect_n4a_py_bundle(tmp_path: Path) -> None:
     bundle = tmp_path / "model.n4a.py"
     bundle.write_text("# embedded bundle\n", encoding="utf-8")

@@ -34,6 +34,7 @@ from .detect import (
 )
 from .errors import UnsupportedInput, VerificationFailed
 from .exit_codes import ExitCode
+from .native_results import NativeResultsPreview, load_native_results_preview, lower_native_results_preview
 from .policy import (
     assert_disjoint,
     assert_output_available,
@@ -709,6 +710,48 @@ def migrate(
                 strict=strict,
                 verify_after=verify,
             )
+        native_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_NATIVE_RESULTS_V1]
+        if native_artifacts:
+            if len(native_artifacts) == 1 and len(detection.artifacts) == 1:
+                native_artifact = native_artifacts[0]
+                try:
+                    native_preview = load_native_results_preview(_artifact_source_path(input_path, native_artifact))
+                except UnsupportedInput as exc:
+                    if strict:
+                        raise
+                    return _run_opaque_artifact_preservation(
+                        input_path,
+                        output,
+                        native_artifacts,
+                        manifest,
+                        report,
+                        manifest_path,
+                        report_path,
+                        id_map_path,
+                        strict=False,
+                        verify_after=verify,
+                        unsupported_reason=exc.message,
+                        unsupported_cause=exc.cause,
+                    )
+                return _run_native_results_preview_transform(
+                    input_path,
+                    output,
+                    native_artifact,
+                    native_preview,
+                    manifest,
+                    report,
+                    manifest_path,
+                    report_path,
+                    id_map_path,
+                    verify_after=verify,
+                )
+            if strict:
+                names = ", ".join(f"{art.path}({art.source_kind})" for art in native_artifacts)
+                raise UnsupportedInput(
+                    f"native-results-v1 lowering preview supports exactly one standalone artifact, got: {names}",
+                    cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+                    mitigation="rerun without --strict to preserve mixed native artifacts opaque",
+                )
         opaque_artifacts = _preservable_opaque_artifacts(detection)
         if opaque_artifacts:
             return _run_opaque_artifact_preservation(
@@ -932,6 +975,99 @@ def _run_sqlite_legacy_arrays_transform(
         source.close()
 
 
+def _run_native_results_preview_transform(
+    input_path: Path,
+    output: Path,
+    artifact: DetectedArtifact,
+    preview: NativeResultsPreview,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    *,
+    verify_after: bool = False,
+) -> ExitCode:
+    """Lower one validated native-results-v1 directory to workspace-v2 metadata."""
+    created = not output.exists()
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        target_store = output / "store.sqlite"
+        target = sqlite3.connect(target_store)
+        try:
+            create_workspace_v2_schema(target)
+            lower_native_results_preview(target, preview)
+            target.commit()
+            target_counts = _target_row_counts(target)
+        finally:
+            target.close()
+
+        source = _artifact_source_path(input_path, artifact)
+        rel = _artifact_preserved_rel(input_path, artifact)
+        artifact_checksums = _copy_preserved_artifact(source, output / rel, rel)
+        checksums = {"store.sqlite": sha256_file(target_store), **artifact_checksums}
+
+        manifest["checksums"] = checksums
+        manifest["output_inventory"] = [
+            {
+                "path": "store.sqlite",
+                "tables": {table: {} for table in WORKSPACE_V2_TABLES},
+                "row_counts": target_counts,
+                "generated_manifests": [
+                    contracts.DEFAULT_MANIFEST_NAME,
+                    contracts.DEFAULT_REPORT_NAME,
+                    contracts.DEFAULT_ID_MAP_NAME,
+                ],
+            },
+            {
+                "path": rel,
+                "tables": {},
+                "row_counts": {"files": len(artifact_checksums)},
+                "generated_manifests": [],
+            },
+        ]
+        manifest["tool"]["completed_at"] = _now_iso()
+
+        report["status"] = vocab.STATUS_SUCCESS
+        report["source_summary"]["row_counts"] = {
+            "native_prediction_rows": len(preview.prediction_rows),
+            "native_artifacts": len(preview.manifest.get("artifacts", []) or []),
+        }
+        report["target_summary"]["kind"] = vocab.TARGET_WORKSPACE_V2
+        report["target_summary"]["preview"] = {
+            "native_results_metadata_only": True,
+            "source_payload_preserved": rel,
+        }
+        report["migrated_counts"].update(
+            {
+                "runs": target_counts["runs"],
+                "pipelines": target_counts["pipelines"],
+                "chains": target_counts["chains"],
+                "predictions": target_counts["predictions"],
+                "artifacts": target_counts["artifacts"],
+                "arrays": 0,
+            }
+        )
+        report["preserved_counts"]["native_payloads"] = 1
+        report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+
+        if manifest_path is not None:
+            _write_json(manifest_path, manifest)
+        if verify_after:
+            exclude_names = {p.name for p in (manifest_path, report_path, id_map_path) if p is not None}
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            _raise_if_verification_failed(report["verification_summary"])
+        if report_path is not None:
+            _write_json(report_path, report)
+        if id_map_path is not None:
+            _write_json(id_map_path, manifest["old_to_new_ids"])
+        return ExitCode.SUCCESS
+    except Exception:
+        if created and output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+        raise
+
+
 def _run_opaque_artifact_preservation(
     input_path: Path,
     output: Path,
@@ -944,6 +1080,8 @@ def _run_opaque_artifact_preservation(
     *,
     strict: bool,
     verify_after: bool = False,
+    unsupported_reason: str = "semantic lowering to workspace-v2 is not implemented in this slice",
+    unsupported_cause: str | None = None,
 ) -> ExitCode:
     """Preserve native results / bundle artifacts without executing legacy code."""
     if strict:
@@ -992,10 +1130,12 @@ def _run_opaque_artifact_preservation(
                 {
                     "item": art.path,
                     "source_kind": art.source_kind,
-                    "reason": "semantic lowering to workspace-v2 is not implemented in this slice",
+                    "reason": unsupported_reason,
                     "disposition": "preserved",
                 }
             )
+            if unsupported_cause is not None:
+                manifest["unsupported"][-1]["cause"] = unsupported_cause
             output_inventory.append(
                 {
                     "path": rel,
