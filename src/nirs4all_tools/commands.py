@@ -3,12 +3,10 @@
 Each function returns an :class:`ExitCode` and raises :class:`ToolError`
 subclasses for refusals/failures (the CLI maps those to process exit codes).
 
-Scaffold scope (``IMP-L18``): ``inspect``, ``migrate --dry-run``, the
-``--copy-only`` safety hatch, and the manifest-self-consistency core of
-``verify`` are fully wired and exercise the real no-in-place machinery. The
-schema-transform engine (legacy reader → ``nirs4all-workspace-v2`` store) is
-deliberately left as a clearly-marked stub — it needs the gated legacy readers
-and is not part of this scaffold.
+``inspect``, ``migrate --dry-run``, the ``--copy-only`` safety hatch, focused
+workspace-v2 lowering, opaque preservation, and manifest/sidecar verification
+all exercise the real no-in-place machinery. Format-specific legacy readers
+stay here rather than in the runtime.
 """
 
 from __future__ import annotations
@@ -24,10 +22,15 @@ from typing import Any
 from . import contracts, vocab
 from .checksums import sha256_bytes, sha256_file
 from .detect import (
+    KIND_DUCKDB_WORKSPACE,
+    KIND_FS_RUNS_LEGACY,
+    KIND_FS_RUNS_V2,
+    KIND_LOOSE_PREDICTIONS,
     KIND_N4A_BUNDLE,
     KIND_N4A_PY_BUNDLE,
     KIND_NATIVE_RESULTS_V1,
     KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS,
+    KIND_SQLITE_WORKSPACE_V2,
     DetectedArtifact,
     DetectionResult,
     detect_sources,
@@ -67,7 +70,18 @@ _PREDICTION_ARRAY_METADATA_COLUMNS = (
     "val_score",
     "task_type",
 )
-_OPAQUE_PRESERVABLE_KINDS = frozenset({KIND_NATIVE_RESULTS_V1, KIND_N4A_BUNDLE, KIND_N4A_PY_BUNDLE})
+_OPAQUE_PRESERVABLE_KINDS = frozenset(
+    {
+        KIND_DUCKDB_WORKSPACE,
+        KIND_FS_RUNS_LEGACY,
+        KIND_FS_RUNS_V2,
+        KIND_LOOSE_PREDICTIONS,
+        KIND_N4A_BUNDLE,
+        KIND_N4A_PY_BUNDLE,
+        KIND_NATIVE_RESULTS_V1,
+        KIND_SQLITE_WORKSPACE_V2,
+    }
+)
 _UNSAFE_ARRAY_FILENAME_RE = re.compile(r'[/\\:*?"<>|\s.]+')
 _RUNTIME_ARRAY_RECORD_FIELDS = (
     "prediction_id",
@@ -95,6 +109,39 @@ def _now_iso() -> str:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _generated_contract_names() -> list[str]:
+    """Return default generated contract names placed next to migrated outputs."""
+    return [
+        contracts.DEFAULT_MANIFEST_NAME,
+        contracts.DEFAULT_REPORT_NAME,
+        contracts.DEFAULT_ID_MAP_NAME,
+        contracts.DEFAULT_UNSUPPORTED_REPORT_NAME,
+    ]
+
+
+def _write_unsupported_report(
+    path: Path | None,
+    *,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    target_path: Path,
+) -> None:
+    """Write the machine-readable unsupported report when a path is active."""
+    if path is None:
+        return
+    document = contracts.build_unsupported_report(
+        manifest=manifest,
+        report=report,
+        target_path=str(target_path),
+    )
+    _write_json(path, document)
+
+
+def _contract_exclude_names(*paths: Path | None) -> set[str]:
+    """Return contract filenames that verification should not treat as orphans."""
+    return {p.name for p in paths if p is not None}
 
 
 def _source_fingerprint(source: Path) -> str:
@@ -206,19 +253,21 @@ def _resolve_contract_paths(
     manifest_path: Path | None,
     report_path: Path | None,
     id_map_path: Path | None,
+    unsupported_report_path: Path | None,
     dry_run: bool,
-) -> tuple[Path | None, Path | None, Path | None]:
+) -> tuple[Path | None, Path | None, Path | None, Path | None]:
     """Resolve where the manifest/report/id-map land.
 
     For a real run, unset paths default to files inside the (disjoint) output
     directory. For ``--dry-run`` only explicitly-given paths are honored (§11).
     """
     if dry_run:
-        return manifest_path, report_path, id_map_path
+        return manifest_path, report_path, id_map_path, unsupported_report_path
     manifest = manifest_path or (output / contracts.DEFAULT_MANIFEST_NAME)
     report = report_path or (output / contracts.DEFAULT_REPORT_NAME)
     id_map = id_map_path or (output / contracts.DEFAULT_ID_MAP_NAME)
-    return manifest, report, id_map
+    unsupported = unsupported_report_path or (output / contracts.DEFAULT_UNSUPPORTED_REPORT_NAME)
+    return manifest, report, id_map, unsupported
 
 
 def _copy_only(source: Path, output: Path, manifest: dict[str, Any]) -> dict[str, str]:
@@ -255,11 +304,7 @@ def _copy_only(source: Path, output: Path, manifest: dict[str, Any]) -> dict[str
             "path": _PAYLOAD_DIRNAME,
             "tables": {},
             "row_counts": {"files": file_count},
-            "generated_manifests": [
-                contracts.DEFAULT_MANIFEST_NAME,
-                contracts.DEFAULT_REPORT_NAME,
-                contracts.DEFAULT_ID_MAP_NAME,
-            ],
+            "generated_manifests": _generated_contract_names(),
         }
     ]
     return checksums
@@ -591,6 +636,25 @@ def _artifact_preserved_rel(input_path: Path, art: DetectedArtifact) -> str:
     return f"{_PRESERVED_DIRNAME}/{art.source_kind}/{name}"
 
 
+def _unsupported_entry(
+    art: DetectedArtifact,
+    *,
+    reason: str,
+    disposition: str,
+    cause: str | None = None,
+) -> dict[str, Any]:
+    """Return the durable unsupported-item record for one artifact."""
+    entry: dict[str, Any] = {
+        "item": art.path,
+        "source_kind": art.source_kind,
+        "reason": reason,
+        "disposition": disposition,
+    }
+    if cause is not None:
+        entry["cause"] = cause
+    return entry
+
+
 def _copy_preserved_artifact(source: Path, dest: Path, rel_prefix: str) -> dict[str, str]:
     """Copy one opaque artifact and return file-level checksums keyed by output path."""
     checksums: dict[str, str] = {}
@@ -609,6 +673,79 @@ def _copy_preserved_artifact(source: Path, dest: Path, rel_prefix: str) -> dict[
     return checksums
 
 
+def _copy_preserved_detected_artifact(
+    input_path: Path,
+    output: Path,
+    art: DetectedArtifact,
+) -> tuple[str, dict[str, str]]:
+    """Copy one detected opaque artifact, preserving only loose prediction files when possible."""
+    rel = _artifact_preserved_rel(input_path, art)
+    if art.source_kind == KIND_LOOSE_PREDICTIONS:
+        files = art.details.get("files")
+        if isinstance(files, list) and files:
+            checksums: dict[str, str] = {}
+            dest_root = output / rel
+            for name in sorted(str(item) for item in files):
+                if Path(name).is_absolute() or ".." in Path(name).parts:
+                    continue
+                source = input_path / name
+                if not source.is_file():
+                    continue
+                dest = dest_root / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, dest)
+                checksums[f"{rel}/{name}"] = sha256_file(dest)
+            return rel, checksums
+
+    source = _artifact_source_path(input_path, art)
+    return rel, _copy_preserved_artifact(source, output / rel, rel)
+
+
+def _record_preserved_artifacts(
+    input_path: Path,
+    output: Path,
+    artifacts: list[DetectedArtifact],
+    *,
+    manifest: dict[str, Any],
+    checksums: dict[str, str],
+    output_inventory: list[dict[str, Any]],
+    unsupported_reason: str,
+    unsupported_cause: str | None,
+) -> None:
+    """Copy opaque artifacts into ``output`` and update manifest/inventory ledgers."""
+    for art in artifacts:
+        rel, artifact_checksums = _copy_preserved_detected_artifact(input_path, output, art)
+        checksums.update(artifact_checksums)
+        checksum = (
+            sha256_file(output / rel)
+            if (output / rel).is_file()
+            else sha256_bytes(json.dumps(artifact_checksums, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        )
+        manifest["preserved_opaque"].append(
+            {
+                "path": rel,
+                "reason": art.source_kind,
+                "checksum": checksum,
+            }
+        )
+        manifest["unsupported"].append(
+            _unsupported_entry(
+                art,
+                reason=unsupported_reason,
+                disposition="preserved",
+                cause=unsupported_cause,
+            )
+        )
+        output_inventory.append(
+            {
+                "path": rel,
+                "tables": {},
+                "row_counts": {"files": len(artifact_checksums)},
+                "generated_manifests": [],
+            }
+        )
+
+
 def _preservable_opaque_artifacts(detection: DetectionResult) -> list[DetectedArtifact]:
     """Return supported opaque artifacts that can be preserved in best-effort mode."""
     return [art for art in detection.artifacts if art.source_kind in _OPAQUE_PRESERVABLE_KINDS]
@@ -619,6 +756,40 @@ def _target_row_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {table: _sqlite_count(conn, table) for table in WORKSPACE_V2_TABLES}
 
 
+def _dry_run_unsupported_items(input_path: Path, detection: DetectionResult) -> list[dict[str, Any]]:
+    """Classify what a best-effort run would preserve opaque instead of lower."""
+    unsupported: list[dict[str, Any]] = []
+    native_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_NATIVE_RESULTS_V1]
+    standalone_native = len(native_artifacts) == 1 and len(detection.artifacts) == 1
+
+    for art in detection.artifacts:
+        if art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS:
+            continue
+        if art.source_kind == KIND_NATIVE_RESULTS_V1 and standalone_native:
+            try:
+                load_native_results_preview(_artifact_source_path(input_path, art))
+            except UnsupportedInput as exc:
+                unsupported.append(
+                    _unsupported_entry(
+                        art,
+                        reason=exc.message,
+                        disposition="would_preserve",
+                        cause=exc.cause,
+                    )
+                )
+            continue
+        if art.source_kind in _OPAQUE_PRESERVABLE_KINDS:
+            unsupported.append(
+                _unsupported_entry(
+                    art,
+                    reason="semantic lowering to workspace-v2 is not implemented in this tool release",
+                    disposition="would_preserve",
+                    cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+                )
+            )
+    return unsupported
+
+
 def migrate(
     input_path: Path,
     *,
@@ -627,6 +798,7 @@ def migrate(
     manifest_path: Path | None = None,
     report_path: Path | None = None,
     id_map_path: Path | None = None,
+    unsupported_report_path: Path | None = None,
     checksums_algo: str = "sha256",
     dry_run: bool = False,
     verify: bool = False,
@@ -638,8 +810,8 @@ def migrate(
 ) -> ExitCode:
     """Convert a legacy source into a fresh ``--output`` (no-in-place, one-way).
 
-    Only the pre-flight policy + ``--dry-run`` + ``--copy-only`` paths are
-    implemented in this scaffold; the schema-transform engine is a stub.
+    Non-lowerable recognized artifacts are preserved opaque in best-effort
+    mode; strict mode requires semantic lowering and refuses before writing.
     """
     # --- Pre-flight: target + path policy (no writes yet) ------------------
     if target == vocab.TARGET_NATIVE_RESULTS_V1:
@@ -674,14 +846,15 @@ def migrate(
         )
 
     assert_disjoint(input_path, output)
-    manifest_path, report_path, id_map_path = _resolve_contract_paths(
+    manifest_path, report_path, id_map_path, unsupported_report_path = _resolve_contract_paths(
         output=output,
         manifest_path=manifest_path,
         report_path=report_path,
         id_map_path=id_map_path,
+        unsupported_report_path=unsupported_report_path,
         dry_run=dry_run,
     )
-    for explicit in (manifest_path, report_path, id_map_path):
+    for explicit in (manifest_path, report_path, id_map_path, unsupported_report_path):
         if explicit is not None:
             assert_path_outside_source(input_path, explicit)
 
@@ -729,7 +902,16 @@ def migrate(
     # --- Execute under the whole-source-tree integrity guard --------------
     with source_guard(input_path):
         if dry_run:
-            return _run_dry_run(detection, manifest, report, manifest_path, report_path, output)
+            return _run_dry_run(
+                input_path,
+                detection,
+                manifest,
+                report,
+                manifest_path,
+                report_path,
+                unsupported_report_path,
+                output,
+            )
         if copy_only:
             return _run_copy_only(
                 input_path,
@@ -739,9 +921,21 @@ def migrate(
                 manifest_path,
                 report_path,
                 id_map_path,
+                unsupported_report_path,
                 verify_after=verify,
             )
         if any(art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS for art in detection.artifacts):
+            extra_opaque_artifacts = [
+                art for art in _preservable_opaque_artifacts(detection)
+                if art.source_kind != KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS
+            ]
+            if strict and extra_opaque_artifacts:
+                names = ", ".join(f"{art.path}({art.source_kind})" for art in extra_opaque_artifacts)
+                raise UnsupportedInput(
+                    f"strict migration cannot lower additional legacy artifact(s) into workspace-v2 yet: {names}",
+                    cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+                    mitigation="rerun without --strict to preserve opaque artifacts with checksums, or use --copy-only",
+                )
             return _run_sqlite_legacy_arrays_transform(
                 input_path,
                 output,
@@ -750,6 +944,8 @@ def migrate(
                 manifest_path,
                 report_path,
                 id_map_path,
+                unsupported_report_path,
+                extra_opaque_artifacts=extra_opaque_artifacts,
                 strict=strict,
                 verify_after=verify,
             )
@@ -771,6 +967,7 @@ def migrate(
                         manifest_path,
                         report_path,
                         id_map_path,
+                        unsupported_report_path,
                         strict=False,
                         verify_after=verify,
                         unsupported_reason=exc.message,
@@ -786,6 +983,7 @@ def migrate(
                     manifest_path,
                     report_path,
                     id_map_path,
+                    unsupported_report_path,
                     verify_after=verify,
                 )
             if strict:
@@ -806,38 +1004,56 @@ def migrate(
                 manifest_path,
                 report_path,
                 id_map_path,
+                unsupported_report_path,
                 strict=strict,
                 verify_after=verify,
             )
         # Real schema transform — deliberately not implemented in this scaffold.
         raise UnsupportedInput(
-            "schema-transform migrate to nirs4all-workspace-v2 is only implemented for sqlite-workspace-legacy-arrays",
+            "schema-transform migrate to nirs4all-workspace-v2 is not available for this source shape",
             cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
             mitigation="use --dry-run to preview, --copy-only to archive, or 'legacy inspect'",
         )
 
 
 def _run_dry_run(
+    input_path: Path,
     detection: DetectionResult,
     manifest: dict[str, Any],
     report: dict[str, Any],
     manifest_path: Path | None,
     report_path: Path | None,
+    unsupported_report_path: Path | None,
     output: Path,
 ) -> ExitCode:
     """Detection + simulation only; never writes the output store (§11)."""
+    unsupported = _dry_run_unsupported_items(input_path, detection)
+    manifest["unsupported"] = unsupported
     manifest["warnings"].append("dry-run: no output store written")
-    report["status"] = vocab.STATUS_SUCCESS
+    report["status"] = vocab.STATUS_MIGRATED_WITH_WARNINGS if unsupported else vocab.STATUS_SUCCESS
     report["warnings"].append("dry-run: detection + mapping simulation only")
+    report["unsupported_counts"]["preserved"] = len(unsupported)
     report["target_summary"]["path"] = str(output)
     report["recommended_next_command"] = (
         f"nirs4all-tools legacy migrate <input> --output {output} --target {vocab.TARGET_WORKSPACE_V2}"
     )
     if manifest_path is not None:
         _write_json(manifest_path, manifest)
+    _write_unsupported_report(
+        unsupported_report_path,
+        manifest=manifest,
+        report=report,
+        target_path=output,
+    )
     if report_path is not None:
         _write_json(report_path, report)
-    preview = {"dry_run": True, "kinds": detection.kinds, "artifacts": len(detection.artifacts)}
+    preview = {
+        "dry_run": True,
+        "kinds": detection.kinds,
+        "artifacts": len(detection.artifacts),
+        "unsupported": len(unsupported),
+        "would_preserve_opaque": len(unsupported),
+    }
     print(json.dumps(preview, indent=2, sort_keys=True))
     return ExitCode.SUCCESS
 
@@ -850,6 +1066,7 @@ def _run_copy_only(
     manifest_path: Path | None,
     report_path: Path | None,
     id_map_path: Path | None,
+    unsupported_report_path: Path | None,
     *,
     verify_after: bool = False,
 ) -> ExitCode:
@@ -865,8 +1082,14 @@ def _run_copy_only(
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
+        _write_unsupported_report(
+            unsupported_report_path,
+            manifest=manifest,
+            report=report,
+            target_path=output,
+        )
         if verify_after:
-            exclude_names = {p.name for p in (manifest_path, report_path, id_map_path) if p is not None}
+            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
             report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
@@ -888,7 +1111,9 @@ def _run_sqlite_legacy_arrays_transform(
     manifest_path: Path | None,
     report_path: Path | None,
     id_map_path: Path | None,
+    unsupported_report_path: Path | None,
     *,
+    extra_opaque_artifacts: list[DetectedArtifact] | None = None,
     strict: bool,
     verify_after: bool = False,
 ) -> ExitCode:
@@ -916,11 +1141,7 @@ def _run_sqlite_legacy_arrays_transform(
                     "path": "store.sqlite",
                     "tables": {table: {} for table in WORKSPACE_V2_TABLES},
                     "row_counts": copied_counts,
-                    "generated_manifests": [
-                        contracts.DEFAULT_MANIFEST_NAME,
-                        contracts.DEFAULT_REPORT_NAME,
-                        contracts.DEFAULT_ID_MAP_NAME,
-                    ],
+                    "generated_manifests": _generated_contract_names(),
                 }
             ]
             if legacy_rows:
@@ -960,6 +1181,19 @@ def _run_sqlite_legacy_arrays_transform(
                     }
                 )
 
+            extra_opaque_artifacts = extra_opaque_artifacts or []
+            if extra_opaque_artifacts:
+                _record_preserved_artifacts(
+                    input_path,
+                    output,
+                    extra_opaque_artifacts,
+                    manifest=manifest,
+                    checksums=checksums,
+                    output_inventory=output_inventory,
+                    unsupported_reason="artifact is outside this release's workspace-v2 semantic lowering slice",
+                    unsupported_cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+                )
+
             manifest["checksums"] = checksums
             manifest["output_inventory"] = output_inventory
             if legacy_rows:
@@ -991,7 +1225,12 @@ def _run_sqlite_legacy_arrays_transform(
                 }
             )
             report["preserved_counts"]["unknown_columns"] = 0
-            if legacy_rows and not arrays_lowered:
+            if extra_opaque_artifacts:
+                report["preserved_counts"]["opaque_artifacts"] = len(extra_opaque_artifacts)
+                report["unsupported_counts"]["preserved"] += len(extra_opaque_artifacts)
+                manifest["warnings"].append("additional legacy workspace artifacts preserved opaque with checksums")
+                report["warnings"].append("additional legacy workspace artifacts preserved opaque with checksums")
+            if (legacy_rows and not arrays_lowered) or extra_opaque_artifacts:
                 report["status"] = vocab.STATUS_MIGRATED_WITH_WARNINGS
             else:
                 report["status"] = vocab.STATUS_SUCCESS
@@ -999,15 +1238,26 @@ def _run_sqlite_legacy_arrays_transform(
 
             if manifest_path is not None:
                 _write_json(manifest_path, manifest)
+            _write_unsupported_report(
+                unsupported_report_path,
+                manifest=manifest,
+                report=report,
+                target_path=output,
+            )
             if verify_after:
-                exclude_names = {p.name for p in (manifest_path, report_path, id_map_path) if p is not None}
+                exclude_names = _contract_exclude_names(
+                    manifest_path,
+                    report_path,
+                    id_map_path,
+                    unsupported_report_path,
+                )
                 report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
                 _raise_if_verification_failed(report["verification_summary"])
             if report_path is not None:
                 _write_json(report_path, report)
             if id_map_path is not None:
                 _write_json(id_map_path, manifest["old_to_new_ids"])
-            if legacy_rows and not arrays_lowered:
+            if (legacy_rows and not arrays_lowered) or extra_opaque_artifacts:
                 return ExitCode.MIGRATED_WITH_WARNINGS
             return ExitCode.SUCCESS
         except Exception:
@@ -1028,6 +1278,7 @@ def _run_native_results_preview_transform(
     manifest_path: Path | None,
     report_path: Path | None,
     id_map_path: Path | None,
+    unsupported_report_path: Path | None,
     *,
     verify_after: bool = False,
 ) -> ExitCode:
@@ -1058,11 +1309,7 @@ def _run_native_results_preview_transform(
                 "path": "store.sqlite",
                 "tables": {table: {} for table in WORKSPACE_V2_TABLES},
                 "row_counts": target_counts,
-                "generated_manifests": [
-                    contracts.DEFAULT_MANIFEST_NAME,
-                    contracts.DEFAULT_REPORT_NAME,
-                    contracts.DEFAULT_ID_MAP_NAME,
-                ],
+                "generated_manifests": _generated_contract_names(),
             },
             *runtime_array_inventory,
             {
@@ -1100,8 +1347,14 @@ def _run_native_results_preview_transform(
 
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
+        _write_unsupported_report(
+            unsupported_report_path,
+            manifest=manifest,
+            report=report,
+            target_path=output,
+        )
         if verify_after:
-            exclude_names = {p.name for p in (manifest_path, report_path, id_map_path) if p is not None}
+            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
             report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
@@ -1124,13 +1377,14 @@ def _run_opaque_artifact_preservation(
     manifest_path: Path | None,
     report_path: Path | None,
     id_map_path: Path | None,
+    unsupported_report_path: Path | None,
     *,
     strict: bool,
     verify_after: bool = False,
     unsupported_reason: str = "semantic lowering to workspace-v2 is not implemented in this slice",
     unsupported_cause: str | None = None,
 ) -> ExitCode:
-    """Preserve native results / bundle artifacts without executing legacy code."""
+    """Preserve non-lowerable artifacts without executing legacy code."""
     if strict:
         names = ", ".join(f"{art.path}({art.source_kind})" for art in artifacts)
         raise UnsupportedInput(
@@ -1149,53 +1403,25 @@ def _run_opaque_artifact_preservation(
                 "path": "store.sqlite",
                 "tables": {table: {} for table in WORKSPACE_V2_TABLES},
                 "row_counts": target_counts,
-                "generated_manifests": [
-                    contracts.DEFAULT_MANIFEST_NAME,
-                    contracts.DEFAULT_REPORT_NAME,
-                    contracts.DEFAULT_ID_MAP_NAME,
-                ],
+                "generated_manifests": _generated_contract_names(),
             }
         ]
 
-        for art in artifacts:
-            source = _artifact_source_path(input_path, art)
-            rel = _artifact_preserved_rel(input_path, art)
-            dest = output / rel
-            artifact_checksums = _copy_preserved_artifact(source, dest, rel)
-            checksums.update(artifact_checksums)
-            checksum = sha256_file(dest) if dest.is_file() else sha256_bytes(
-                json.dumps(artifact_checksums, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            )
-            manifest["preserved_opaque"].append(
-                {
-                    "path": rel,
-                    "reason": art.source_kind,
-                    "checksum": checksum,
-                }
-            )
-            manifest["unsupported"].append(
-                {
-                    "item": art.path,
-                    "source_kind": art.source_kind,
-                    "reason": unsupported_reason,
-                    "disposition": "preserved",
-                }
-            )
-            if unsupported_cause is not None:
-                manifest["unsupported"][-1]["cause"] = unsupported_cause
-            output_inventory.append(
-                {
-                    "path": rel,
-                    "tables": {},
-                    "row_counts": {"files": len(artifact_checksums)},
-                    "generated_manifests": [],
-                }
-            )
+        _record_preserved_artifacts(
+            input_path,
+            output,
+            artifacts,
+            manifest=manifest,
+            checksums=checksums,
+            output_inventory=output_inventory,
+            unsupported_reason=unsupported_reason,
+            unsupported_cause=unsupported_cause,
+        )
 
         manifest["checksums"] = checksums
         manifest["output_inventory"] = output_inventory
         manifest["warnings"].append(
-            "opaque native-results/bundle artifacts preserved with checksums; no runtime legacy reader is used"
+            "opaque legacy artifacts preserved with checksums; no runtime legacy reader is used"
         )
         manifest["tool"]["completed_at"] = _now_iso()
 
@@ -1214,14 +1440,20 @@ def _run_opaque_artifact_preservation(
         report["preserved_counts"]["opaque_artifacts"] = len(artifacts)
         report["unsupported_counts"]["preserved"] = len(artifacts)
         report["warnings"].append(
-            "opaque native-results/bundle artifacts preserved; rerun a future tool release for semantic lowering"
+            "opaque legacy artifacts preserved; rerun a future tool release for semantic lowering"
         )
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
 
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
+        _write_unsupported_report(
+            unsupported_report_path,
+            manifest=manifest,
+            report=report,
+            target_path=output,
+        )
         if verify_after:
-            exclude_names = {p.name for p in (manifest_path, report_path, id_map_path) if p is not None}
+            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
             report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
@@ -1392,6 +1624,7 @@ def _verification_summary_from_manifest(
         contracts.DEFAULT_MANIFEST_NAME,
         contracts.DEFAULT_REPORT_NAME,
         contracts.DEFAULT_ID_MAP_NAME,
+        contracts.DEFAULT_UNSUPPORTED_REPORT_NAME,
     }
     if exclude_names is not None:
         exclude.update(exclude_names)

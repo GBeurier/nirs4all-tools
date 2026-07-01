@@ -74,6 +74,46 @@ def test_build_report_skeleton() -> None:
         assert report["migrated_counts"][key] == 0
 
 
+def test_build_unsupported_report_is_machine_readable() -> None:
+    manifest = contracts.build_manifest(
+        tool_version="0.0.1",
+        support_window="window",
+        source_path="/tmp/ws",
+        source_fingerprint="sha256:abc",
+        source_kinds=["loose-predictions"],
+        detected_versions={},
+        target_kind="nirs4all-workspace-v2",
+        target_schema_version=2,
+    )
+    manifest["unsupported"].append(
+        {
+            "item": ".",
+            "source_kind": "loose-predictions",
+            "reason": "not lowerable",
+            "disposition": "preserved",
+        }
+    )
+    manifest["preserved_opaque"].append(
+        {
+            "path": "preserved/loose-predictions/ws",
+            "reason": "loose-predictions",
+            "checksum": "sha256:def",
+        }
+    )
+    report = contracts.build_report(
+        status="migrated_with_warnings",
+        target_kind="nirs4all-workspace-v2",
+        target_path="/tmp/out",
+        source_kinds=["loose-predictions"],
+    )
+    unsupported = contracts.build_unsupported_report(manifest=manifest, report=report, target_path="/tmp/out")
+
+    assert unsupported["$id"] == contracts.UNSUPPORTED_REPORT_SCHEMA_ID
+    assert unsupported["schema_version"] == 1
+    assert unsupported["counts"] == {"unsupported": 1, "preserved": 1, "refused": 0, "opaque_payloads": 1}
+    assert unsupported["unsupported"] == manifest["unsupported"]
+
+
 def test_environment_block_reports_python() -> None:
     env = contracts.environment_block()
     assert "python" in env

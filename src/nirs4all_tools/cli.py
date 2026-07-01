@@ -5,6 +5,7 @@ nirs4all-tools --version
 nirs4all-tools legacy inspect <input> [--format json|text] [--report PATH]
 nirs4all-tools legacy migrate <input> --output DIR --target nirs4all-workspace-v2
                                       [--manifest PATH] [--report PATH] [--id-map PATH]
+                                      [--unsupported-report PATH]
                                       [--checksums sha256]
                                       [--dry-run | --verify]
                                       [--strict | --best-effort]
@@ -39,6 +40,7 @@ def _cmd_migrate(args: argparse.Namespace) -> ExitCode:
         manifest_path=args.manifest,
         report_path=args.report,
         id_map_path=args.id_map,
+        unsupported_report_path=args.unsupported_report,
         checksums_algo=args.checksums,
         dry_run=args.dry_run,
         verify=args.verify,
@@ -89,6 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
     mig.add_argument("--report", type=Path, default=None, help="report path (default: <output>/migration-report.json)")
     mig.add_argument(
         "--id-map", dest="id_map", type=Path, default=None, help="id-map path (default: <output>/migration-id-map.json)"
+    )
+    mig.add_argument(
+        "--unsupported-report",
+        dest="unsupported_report",
+        type=Path,
+        default=None,
+        help="machine-readable unsupported-item report (default: <output>/unsupported-report.json)",
     )
     mig.add_argument("--checksums", choices=["sha256"], default="sha256", help="checksum algorithm")
     mode = mig.add_mutually_exclusive_group()

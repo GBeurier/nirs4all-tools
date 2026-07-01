@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,28 @@ def test_migrate_dry_run_returns_zero(sqlite_v2_workspace: Path, tmp_path: Path)
     )
     assert code == int(ExitCode.SUCCESS)
     assert not (tmp_path / "out").exists()
+
+
+def test_migrate_dry_run_writes_unsupported_report_via_cli(
+    legacy_workspace_inputs: Path,
+    tmp_path: Path,
+) -> None:
+    unsupported_report = tmp_path / "unsupported.json"
+    code = main(
+        [
+            "legacy",
+            "migrate",
+            str(legacy_workspace_inputs),
+            "--output",
+            str(tmp_path / "out"),
+            "--dry-run",
+            "--unsupported-report",
+            str(unsupported_report),
+        ]
+    )
+    assert code == int(ExitCode.SUCCESS)
+    payload = json.loads(unsupported_report.read_text(encoding="utf-8"))
+    assert payload["counts"]["unsupported"] == 3
 
 
 def test_migrate_copy_only_then_verify_via_cli(sqlite_v2_workspace: Path, tmp_path: Path) -> None:

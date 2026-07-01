@@ -148,17 +148,105 @@ def test_migrate_dry_run_refuses_manifest_inside_source(sqlite_v2_workspace: Pat
         )
 
 
-# --- migrate: real transform is a marked stub ------------------------------
-def test_migrate_real_transform_is_unimplemented_and_safe(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+def test_migrate_dry_run_writes_unsupported_report_for_legacy_workspace(
+    legacy_workspace_inputs: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    unsupported_report = tmp_path / "unsupported-report.json"
+    manifest = tmp_path / "preview-manifest.json"
+
+    def run() -> None:
+        code = commands.migrate(
+            legacy_workspace_inputs,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            manifest_path=manifest,
+            unsupported_report_path=unsupported_report,
+            dry_run=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.SUCCESS
+
+    _unchanged(legacy_workspace_inputs, run)
+    assert not out.exists()
+
+    unsupported = json.loads(unsupported_report.read_text(encoding="utf-8"))
+    assert unsupported["counts"]["unsupported"] == 3
+    assert {item["source_kind"] for item in unsupported["unsupported"]} == {
+        "duckdb-workspace",
+        "fs-runs-legacy",
+        "loose-predictions",
+    }
+    assert {item["disposition"] for item in unsupported["unsupported"]} == {"would_preserve"}
+    preview_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    assert preview_manifest["unsupported"] == unsupported["unsupported"]
+
+
+# --- migrate: best-effort preservation and transforms ----------------------
+def test_migrate_sqlite_v2_workspace_preserves_opaque_best_effort(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+) -> None:
     out = tmp_path / "out"
 
     def run() -> None:
-        with pytest.raises(UnsupportedInput) as exc:
-            commands.migrate(sqlite_v2_workspace, output=out, target=vocab.TARGET_WORKSPACE_V2, tool_version="0.0.1")
-        assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_CAPABILITY
+        code = commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.MIGRATED_WITH_WARNINGS
 
     _unchanged(sqlite_v2_workspace, run)
-    assert not out.exists()  # nothing written when the engine refuses
+    assert (out / "store.sqlite").exists()
+    assert (out / "preserved" / "sqlite-workspace-v2" / "store.sqlite").exists()
+
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    unsupported = json.loads((out / "unsupported-report.json").read_text(encoding="utf-8"))
+    assert manifest["unsupported"][0]["source_kind"] == "sqlite-workspace-v2"
+    assert manifest["unsupported"][0]["disposition"] == "preserved"
+    assert unsupported["unsupported"] == manifest["unsupported"]
+
+
+def test_migrate_legacy_workspace_preserves_non_lowerable_payloads(
+    legacy_workspace_inputs: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+
+    def run() -> None:
+        code = commands.migrate(
+            legacy_workspace_inputs,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.MIGRATED_WITH_WARNINGS
+
+    _unchanged(legacy_workspace_inputs, run)
+
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+    unsupported = json.loads((out / "unsupported-report.json").read_text(encoding="utf-8"))
+
+    assert (out / "store.sqlite").exists()
+    assert (out / "preserved" / "duckdb-workspace" / "store.duckdb").read_bytes() == b"legacy duckdb payload"
+    assert (out / "preserved" / "fs-runs-legacy" / "runs" / "run-1" / "pipeline-1" / "manifest.yaml").exists()
+    assert (out / "preserved" / "loose-predictions" / legacy_workspace_inputs.name / "run_predictions.json").exists()
+    assert (out / "preserved" / "loose-predictions" / legacy_workspace_inputs.name / "sample.meta.parquet").exists()
+    assert not (out / "preserved" / "loose-predictions" / legacy_workspace_inputs.name / "store.duckdb").exists()
+
+    assert manifest["checksums"]["preserved/duckdb-workspace/store.duckdb"].startswith("sha256:")
+    assert report["status"] == vocab.STATUS_MIGRATED_WITH_WARNINGS
+    assert report["unsupported_counts"]["preserved"] == 3
+    assert unsupported["counts"]["unsupported"] == 3
+    assert unsupported["counts"]["preserved"] == 3
+    assert {item["disposition"] for item in unsupported["unsupported"]} == {"preserved"}
+    assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
 
 
 def test_migrate_sqlite_legacy_arrays_to_workspace_v2(
@@ -310,6 +398,7 @@ def test_migrate_native_results_preserves_opaque_best_effort(
 
     manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
     report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+    unsupported = json.loads((out / "unsupported-report.json").read_text(encoding="utf-8"))
     preserved_root = out / "preserved" / "native-results-v1" / native_results_dir.name
 
     assert (out / "store.sqlite").exists()
@@ -327,6 +416,8 @@ def test_migrate_native_results_preserves_opaque_best_effort(
     ]
     assert manifest["unsupported"][0]["source_kind"] == "native-results-v1"
     assert manifest["unsupported"][0]["disposition"] == "preserved"
+    assert unsupported["counts"]["unsupported"] == 1
+    assert unsupported["unsupported"] == manifest["unsupported"]
     assert report["status"] == vocab.STATUS_MIGRATED_WITH_WARNINGS
     assert report["preserved_counts"]["opaque_artifacts"] == 1
     assert report["verification_summary"]["passed"] is True
@@ -352,6 +443,7 @@ def test_migrate_native_results_lowers_preview_metadata(
 
     manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
     report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+    unsupported = json.loads((out / "unsupported-report.json").read_text(encoding="utf-8"))
     preserved_root = out / "preserved" / "native-results-v1" / lowerable_native_results_dir.name
     arrays = out / "arrays" / "dataset-a.parquet"
 
@@ -362,6 +454,8 @@ def test_migrate_native_results_lowers_preview_metadata(
     assert (preserved_root / "predictions.parquet").exists()
     assert manifest["preserved_opaque"] == []
     assert manifest["unsupported"] == []
+    assert unsupported["counts"]["unsupported"] == 0
+    assert unsupported["unsupported"] == []
     assert "store.sqlite" in manifest["checksums"]
     assert "arrays/dataset-a.parquet" in manifest["checksums"]
     assert f"preserved/native-results-v1/{lowerable_native_results_dir.name}/predictions.parquet" in manifest[
@@ -520,7 +614,12 @@ def test_copy_only_manifest_uses_contract_inventory_shape(sqlite_v2_workspace: P
         "path": "payload",
         "tables": {},
         "row_counts": {"files": 1},
-        "generated_manifests": ["migration-manifest.json", "migration-report.json", "migration-id-map.json"],
+        "generated_manifests": [
+            "migration-manifest.json",
+            "migration-report.json",
+            "migration-id-map.json",
+            "unsupported-report.json",
+        ],
     }
 
 
@@ -594,6 +693,45 @@ def test_verify_detects_array_row_checksum_mismatch(
     coverage = report["verification_summary"]["checks"]["array_checksum_coverage"]
     assert coverage["status"] == "failed"
     assert coverage["mismatched_rows"] == ["pred-1"]
+
+
+def test_verify_detects_native_results_sidecar_row_checksum_mismatch(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out = tmp_path / "out"
+    commands.migrate(
+        lowerable_native_results_dir,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        strict=True,
+        tool_version="0.0.1",
+    )
+
+    arrays = out / "arrays" / "dataset-a.parquet"
+    table = pq.read_table(arrays)
+    row = table.to_pylist()[0]
+    prediction_id = row["prediction_id"]
+    row["sample_indices"] = [99, 100, 101]
+    pq.write_table(pa.Table.from_pylist([row], schema=table.schema), arrays, compression="zstd", compression_level=3)
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["checksums"]["arrays/dataset-a.parquet"] = sha256_file(arrays)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["array_checksum_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["mismatched_rows"] == [prediction_id]
 
 
 def test_verify_rejects_unreadable_manifest(tmp_path: Path) -> None:

@@ -176,6 +176,18 @@ def make_native_results_dir(root: Path, *, schema_version: int = 2) -> Path:
     return root
 
 
+def make_legacy_workspace_inputs(root: Path) -> Path:
+    """Create a workspace-shaped source with non-lowerable legacy payloads."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "store.duckdb").write_bytes(b"legacy duckdb payload")
+    (root / "run_predictions.json").write_text(json.dumps({"prediction": [1, 2, 3]}), encoding="utf-8")
+    (root / "sample.meta.parquet").write_bytes(b"PAR1legacy metadata")
+    legacy_run = root / "runs" / "run-1" / "pipeline-1"
+    legacy_run.mkdir(parents=True, exist_ok=True)
+    (legacy_run / "manifest.yaml").write_text("run_id: run-1\npipeline_id: pipeline-1\n", encoding="utf-8")
+    return root
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
@@ -314,6 +326,11 @@ def n4a_bundle(tmp_path: Path) -> Path:
 @pytest.fixture
 def native_results_dir(tmp_path: Path) -> Path:
     return make_native_results_dir(tmp_path / "native-results")
+
+
+@pytest.fixture
+def legacy_workspace_inputs(tmp_path: Path) -> Path:
+    return make_legacy_workspace_inputs(tmp_path / "legacy-workspace")
 
 
 @pytest.fixture

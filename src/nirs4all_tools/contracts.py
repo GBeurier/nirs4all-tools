@@ -23,10 +23,12 @@ from typing import Any
 MANIFEST_SCHEMA_ID = "nirs4all-tools/contracts/legacy_migration_manifest.v1.json"
 REPORT_SCHEMA_ID = "nirs4all-tools/contracts/legacy_migration_report.v1.json"
 ID_MAP_SCHEMA_ID = "nirs4all-tools/contracts/legacy_id_map.v1.json"
+UNSUPPORTED_REPORT_SCHEMA_ID = "nirs4all-tools/contracts/legacy_unsupported_report.v1.json"
 
 MANIFEST_SCHEMA_VERSION = 1
 REPORT_SCHEMA_VERSION = 1
 ID_MAP_SCHEMA_VERSION = 1
+UNSUPPORTED_REPORT_SCHEMA_VERSION = 1
 
 # --- Target-schema facts (mirrored from the nirs4all runtime) --------------
 WORKSPACE_V2_USER_VERSION = 2
@@ -39,6 +41,7 @@ FK_SAFE_TABLE_ORDER = ("projects", "runs", "pipelines", "chains", "predictions",
 DEFAULT_MANIFEST_NAME = "migration-manifest.json"
 DEFAULT_REPORT_NAME = "migration-report.json"
 DEFAULT_ID_MAP_NAME = "migration-id-map.json"
+DEFAULT_UNSUPPORTED_REPORT_NAME = "unsupported-report.json"
 
 # Entities tracked by the id-map (``SW4_MIG_CONVERTER_spec.md`` §10).
 ID_MAP_ENTITIES = ("project", "run", "pipeline", "chain", "prediction", "artifact", "dataset", "bundle")
@@ -145,6 +148,40 @@ def build_report(
     }
 
 
+def build_unsupported_report(
+    *,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    target_path: str | None,
+) -> dict[str, Any]:
+    """Return a machine-readable report for unsupported or opaque-preserved items."""
+    unsupported = list(manifest.get("unsupported", []))
+    preserved_opaque = list(manifest.get("preserved_opaque", []))
+    preserved_count = sum(1 for item in unsupported if item.get("disposition") in {"preserved", "would_preserve"})
+    refused_count = sum(1 for item in unsupported if item.get("disposition") == "refused")
+    return {
+        "$id": UNSUPPORTED_REPORT_SCHEMA_ID,
+        "schema_version": UNSUPPORTED_REPORT_SCHEMA_VERSION,
+        "generated_at": _utc_now_iso(),
+        "status": report.get("status"),
+        "source": manifest.get("source", {}),
+        "target": {
+            **dict(manifest.get("target", {})),
+            "path": target_path,
+        },
+        "counts": {
+            "unsupported": len(unsupported),
+            "preserved": preserved_count,
+            "refused": refused_count,
+            "opaque_payloads": len(preserved_opaque),
+        },
+        "unsupported": unsupported,
+        "preserved_opaque": preserved_opaque,
+        "warnings": list(manifest.get("warnings", [])) + list(report.get("warnings", [])),
+        "recommended_next_command": report.get("recommended_next_command"),
+    }
+
+
 def error_entry(*, code: str, cause: str | None, message: str, mitigation: str | None = None) -> dict[str, Any]:
     """Build one ``report.errors[]`` entry (``SW4_MIG_CONVERTER_spec.md`` §8)."""
     return {"code": code, "cause": cause, "message": message, "mitigation": mitigation}
@@ -154,18 +191,22 @@ __all__ = [
     "MANIFEST_SCHEMA_ID",
     "REPORT_SCHEMA_ID",
     "ID_MAP_SCHEMA_ID",
+    "UNSUPPORTED_REPORT_SCHEMA_ID",
     "MANIFEST_SCHEMA_VERSION",
     "REPORT_SCHEMA_VERSION",
     "ID_MAP_SCHEMA_VERSION",
+    "UNSUPPORTED_REPORT_SCHEMA_VERSION",
     "WORKSPACE_V2_USER_VERSION",
     "FK_SAFE_TABLE_ORDER",
     "DEFAULT_MANIFEST_NAME",
     "DEFAULT_REPORT_NAME",
     "DEFAULT_ID_MAP_NAME",
+    "DEFAULT_UNSUPPORTED_REPORT_NAME",
     "ID_MAP_ENTITIES",
     "environment_block",
     "empty_id_map",
     "build_manifest",
     "build_report",
+    "build_unsupported_report",
     "error_entry",
 ]

@@ -50,8 +50,8 @@ nirs4all-tools legacy inspect <input> [--format json|text] [--report PATH]
 
 # Convert into a fresh output (one-way, no-in-place).
 nirs4all-tools legacy migrate <input> --output DIR --target nirs4all-workspace-v2 \
-    [--manifest PATH] [--report PATH] [--id-map PATH] [--checksums sha256] \
-    [--dry-run | --verify] [--strict | --best-effort] \
+    [--manifest PATH] [--report PATH] [--id-map PATH] [--unsupported-report PATH] \
+    [--checksums sha256] [--dry-run | --verify] [--strict | --best-effort] \
     [--copy-only] [--resume] [--trusted-load-joblib]
 
 # Verify an output against its manifest (reads no source).
@@ -75,6 +75,13 @@ Current schema-transform support is intentionally narrow:
   mode preserves them opaque with the same reason in the manifest;
 - `.n4a`, `.n4a.py`, and non-lowerable `native-results-v1` artifacts are preserved as opaque
   checksummed payloads under `preserved/` with an empty workspace-v2 store;
+- non-lowerable legacy workspace payloads such as `store.duckdb`, legacy
+  `runs/` trees, loose prediction files, and already-v2 SQLite stores are also
+  preserved opaque by default in best-effort mode; `--strict` refuses them
+  before writing;
+- every real migration writes `unsupported-report.json` alongside the manifest,
+  report, and id-map; dry runs write the same machine-readable unsupported
+  report only when `--unsupported-report PATH` is provided;
 - best-effort migration exits `10` only when semantic lowering is unavailable
   and content must be preserved opaque;
 - `--strict` requires semantic lowering and exits `0` for fully lowered array
@@ -93,12 +100,14 @@ Current schema-transform support is intentionally narrow:
 
 ## Contracts
 
-Three durable JSON contracts are emitted alongside a migrated workspace
+Four durable JSON contracts are emitted alongside a migrated workspace
 (`SW4_MIG_CONVERTER_spec.md` §7–10):
 
 - `legacy_migration_manifest.v1` — the exhaustive inventory + checksum + id-map ledger;
 - `legacy_migration_report.v1` — the human/UX digest + next action;
 - `legacy_id_map.v1` — the never-lossy old→new id map.
+- `legacy_unsupported_report.v1` — the machine-readable list of unsupported,
+  refused, or opaque-preserved items.
 
 ## Development
 
