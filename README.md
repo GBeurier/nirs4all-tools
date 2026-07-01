@@ -13,8 +13,10 @@ their predictions/pipelines without the runtime ever opening a legacy store.
 > The CLI surface, the no-in-place safety machinery, detection, the contract
 > vocabulary, `inspect`, `migrate --dry-run`, and `--copy-only` are implemented.
 > The first schema transform lowers `sqlite-workspace-legacy-arrays` metadata
-> into a fresh workspace-v2 `store.sqlite`; legacy array rows are preserved as
-> checksummed opaque JSONL until Parquet array lowering is implemented.
+> into a fresh workspace-v2 `store.sqlite`; legacy array rows are lowered into
+> runtime-readable `arrays/<dataset>.parquet` sidecars when the optional
+> `parquet` extra is installed, and the raw rows are still preserved as
+> checksummed JSONL audit provenance.
 
 ## The one contract: no-in-place
 
@@ -57,12 +59,15 @@ Current schema-transform support is intentionally narrow:
 
 - `sqlite-workspace-legacy-arrays` metadata is lowered to `store.sqlite`
   schema v2;
-- the legacy `prediction_arrays` table is not executed or loaded into runtime
-  code, and is preserved in `preserved/legacy-prediction-arrays.jsonl`;
+- the legacy `prediction_arrays` table is decoded offline, lowered to the
+  runtime array sidecar schema (`arrays/<dataset>.parquet`), and also preserved
+  in `preserved/legacy-prediction-arrays.jsonl` for audit;
 - `.n4a`, `.n4a.py`, and `native-results-v1` artifacts are preserved as opaque
   checksummed payloads under `preserved/` with an empty workspace-v2 store;
-- best-effort migration exits `10` when arrays are preserved opaque;
-- `--strict` refuses those sources until full semantic lowering lands.
+- best-effort migration exits `10` only when semantic lowering is unavailable
+  and arrays must be preserved opaque;
+- `--strict` requires semantic lowering and exits `0` for fully lowered array
+  sources.
 
 ### Exit codes
 
