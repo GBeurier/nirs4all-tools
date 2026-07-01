@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from .detect import (
     KIND_N4A_BUNDLE,
     KIND_N4A_PY_BUNDLE,
     KIND_NATIVE_RESULTS_V1,
+    KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS,
     DetectedArtifact,
     DetectionResult,
     detect_sources,
@@ -35,14 +37,19 @@ from .policy import (
     assert_disjoint,
     assert_output_available,
     assert_path_outside_source,
+    read_only_sqlite_uri,
     snapshot_tree,
     source_guard,
 )
+from .workspace_v2 import WORKSPACE_V2_TABLES, create_workspace_v2_schema
 
 #: Declared legacy-reader support window, recorded into every manifest.
 SUPPORT_WINDOW = "nirs4all-tools 0.x — legacy readers supported for an announced number of releases (TOOL-011)"
 
 _PAYLOAD_DIRNAME = "payload"
+_PRESERVED_DIRNAME = "preserved"
+_LEGACY_ARRAYS_JSONL = f"{_PRESERVED_DIRNAME}/legacy-prediction-arrays.jsonl"
+_LEGACY_ARRAY_COLUMNS = ("prediction_id", "y_true", "y_pred", "y_proba", "sample_indices", "weights")
 
 
 def _now_iso() -> str:
@@ -222,6 +229,85 @@ def _copy_only(source: Path, output: Path, manifest: dict[str, Any]) -> dict[str
     return checksums
 
 
+def _sqlite_tables(conn: sqlite3.Connection) -> set[str]:
+    """Return the table names visible in a SQLite connection."""
+    return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _sqlite_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """Return column names for ``table`` in declaration order."""
+    return [row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")]
+
+
+def _sqlite_count(conn: sqlite3.Connection, table: str) -> int:
+    """Return a row count for a trusted table name."""
+    row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+    return int(row[0]) if row else 0
+
+
+def _copy_workspace_v2_tables(source: sqlite3.Connection, target: sqlite3.Connection) -> dict[str, int]:
+    """Copy compatible metadata tables from a legacy SQLite source to v2."""
+    source_tables = _sqlite_tables(source)
+    copied: dict[str, int] = {}
+    for table in WORKSPACE_V2_TABLES:
+        if table not in source_tables:
+            copied[table] = 0
+            continue
+        source_columns = set(_sqlite_columns(source, table))
+        target_columns = _sqlite_columns(target, table)
+        columns = [col for col in target_columns if col in source_columns]
+        if not columns:
+            copied[table] = 0
+            continue
+        column_sql = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        rows = source.execute(f"SELECT {column_sql} FROM {table}").fetchall()
+        if rows:
+            try:
+                target.executemany(f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})", rows)
+            except sqlite3.Error as exc:
+                raise UnsupportedInput(
+                    f"cannot lower SQLite table {table!r} into workspace-v2: {exc}",
+                    cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                    mitigation="use --copy-only to preserve this source verbatim, or update nirs4all-tools",
+                ) from exc
+        copied[table] = len(rows)
+    return copied
+
+
+def _legacy_array_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return legacy ``prediction_arrays`` rows as dictionaries."""
+    if "prediction_arrays" not in _sqlite_tables(conn):
+        return []
+    available = set(_sqlite_columns(conn, "prediction_arrays"))
+    columns = [col for col in _LEGACY_ARRAY_COLUMNS if col in available]
+    if not columns:
+        return []
+    order = "prediction_id" if "prediction_id" in columns else "rowid"
+    rows = conn.execute(f"SELECT {', '.join(columns)} FROM prediction_arrays ORDER BY {order}").fetchall()
+    return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def _write_preserved_legacy_arrays(output: Path, rows: list[dict[str, Any]]) -> dict[str, str]:
+    """Write legacy array rows as deterministic JSONL and return checksums."""
+    preserved_path = output / _LEGACY_ARRAYS_JSONL
+    preserved_path.parent.mkdir(parents=True, exist_ok=True)
+    checksums: dict[str, str] = {}
+    with preserved_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            payload = json.dumps(row, sort_keys=True, separators=(",", ":"))
+            handle.write(payload + "\n")
+            prediction_id = str(row.get("prediction_id") or len(checksums))
+            checksums[f"arrays:{prediction_id}"] = sha256_bytes(payload.encode("utf-8"))
+    checksums[_LEGACY_ARRAYS_JSONL] = sha256_file(preserved_path)
+    return checksums
+
+
+def _target_row_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return row counts for every workspace-v2 table."""
+    return {table: _sqlite_count(conn, table) for table in WORKSPACE_V2_TABLES}
+
+
 def migrate(
     input_path: Path,
     *,
@@ -344,9 +430,21 @@ def migrate(
                 id_map_path,
                 verify_after=verify,
             )
+        if any(art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS for art in detection.artifacts):
+            return _run_sqlite_legacy_arrays_transform(
+                input_path,
+                output,
+                manifest,
+                report,
+                manifest_path,
+                report_path,
+                id_map_path,
+                strict=strict,
+                verify_after=verify,
+            )
         # Real schema transform — deliberately not implemented in this scaffold.
         raise UnsupportedInput(
-            "schema-transform migrate to nirs4all-workspace-v2 is not implemented in this scaffold (L18)",
+            "schema-transform migrate to nirs4all-workspace-v2 is only implemented for sqlite-workspace-legacy-arrays",
             cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
             mitigation="use --dry-run to preview, --copy-only to archive, or 'legacy inspect'",
         )
@@ -413,6 +511,136 @@ def _run_copy_only(
             shutil.rmtree(output, ignore_errors=True)
         raise
     return ExitCode.SUCCESS
+
+
+def _run_sqlite_legacy_arrays_transform(
+    input_path: Path,
+    output: Path,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    *,
+    strict: bool,
+    verify_after: bool = False,
+) -> ExitCode:
+    """Lower a SQLite workspace with a legacy ``prediction_arrays`` table."""
+    store_path = input_path / "store.sqlite"
+    source = sqlite3.connect(read_only_sqlite_uri(store_path), uri=True)
+    try:
+        legacy_rows = _legacy_array_rows(source)
+        if legacy_rows and strict:
+            raise UnsupportedInput(
+                "strict migration cannot preserve legacy prediction_arrays as opaque JSONL",
+                cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+                mitigation="rerun without --strict to preserve arrays as opaque provenance, or use --copy-only",
+            )
+        created = not output.exists()
+        try:
+            output.mkdir(parents=True, exist_ok=True)
+            target_store = output / "store.sqlite"
+            target = sqlite3.connect(target_store)
+            try:
+                create_workspace_v2_schema(target)
+                copied_counts = _copy_workspace_v2_tables(source, target)
+                target.commit()
+            finally:
+                target.close()
+
+            checksums = {"store.sqlite": sha256_file(target_store)}
+            if legacy_rows:
+                preserved_checksums = _write_preserved_legacy_arrays(output, legacy_rows)
+                checksums.update(preserved_checksums)
+                checksum = preserved_checksums[_LEGACY_ARRAYS_JSONL]
+                manifest["preserved_opaque"].append(
+                    {
+                        "path": _LEGACY_ARRAYS_JSONL,
+                        "reason": "legacy_prediction_arrays",
+                        "checksum": checksum,
+                    }
+                )
+                manifest["unsupported"].append(
+                    {
+                        "item": "prediction_arrays",
+                        "reason": "parquet array lowering not implemented in this slice",
+                        "disposition": "preserved",
+                    }
+                )
+                manifest["warnings"].append(
+                    "legacy prediction_arrays preserved as opaque JSONL; not yet lowered to runtime Parquet arrays"
+                )
+                report["warnings"].append(
+                    "legacy prediction_arrays preserved as opaque JSONL; "
+                    "rerun a future tool release for Parquet lowering"
+                )
+                report["unsupported_counts"]["preserved"] = len(legacy_rows)
+
+            manifest["checksums"] = checksums
+            manifest["output_inventory"] = [
+                {
+                    "path": "store.sqlite",
+                    "tables": {table: {} for table in WORKSPACE_V2_TABLES},
+                    "row_counts": copied_counts,
+                    "generated_manifests": [
+                        contracts.DEFAULT_MANIFEST_NAME,
+                        contracts.DEFAULT_REPORT_NAME,
+                        contracts.DEFAULT_ID_MAP_NAME,
+                    ],
+                }
+            ]
+            if legacy_rows:
+                manifest["output_inventory"].append(
+                    {
+                        "path": _LEGACY_ARRAYS_JSONL,
+                        "tables": {},
+                        "row_counts": {"prediction_arrays": len(legacy_rows)},
+                        "generated_manifests": [],
+                    }
+                )
+            manifest["tool"]["completed_at"] = _now_iso()
+
+            target_for_counts = sqlite3.connect(target_store)
+            try:
+                target_counts = _target_row_counts(target_for_counts)
+            finally:
+                target_for_counts.close()
+            report["source_summary"]["row_counts"] = {"prediction_arrays": len(legacy_rows)}
+            report["target_summary"]["kind"] = vocab.TARGET_WORKSPACE_V2
+            report["migrated_counts"].update(
+                {
+                    "runs": target_counts["runs"],
+                    "pipelines": target_counts["pipelines"],
+                    "chains": target_counts["chains"],
+                    "predictions": target_counts["predictions"],
+                    "artifacts": target_counts["artifacts"],
+                    "arrays": 0,
+                }
+            )
+            report["preserved_counts"]["unknown_columns"] = 0
+            if legacy_rows:
+                report["status"] = vocab.STATUS_MIGRATED_WITH_WARNINGS
+            else:
+                report["status"] = vocab.STATUS_SUCCESS
+            report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+
+            if manifest_path is not None:
+                _write_json(manifest_path, manifest)
+            if verify_after:
+                exclude_names = {p.name for p in (manifest_path, report_path, id_map_path) if p is not None}
+                report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+                _raise_if_verification_failed(report["verification_summary"])
+            if report_path is not None:
+                _write_json(report_path, report)
+            if id_map_path is not None:
+                _write_json(id_map_path, manifest["old_to_new_ids"])
+            return ExitCode.MIGRATED_WITH_WARNINGS if legacy_rows else ExitCode.SUCCESS
+        except Exception:
+            if created and output.exists():
+                shutil.rmtree(output, ignore_errors=True)
+            raise
+    finally:
+        source.close()
 
 
 def _iter_output_files(output_dir: Path, exclude: set[str]) -> list[str]:

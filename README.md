@@ -9,10 +9,12 @@ auto-migration trigger; instead, `nirs4all-tools` converts old stores **into**
 the format the runtime already reads (`nirs4all-workspace-v2`), so users keep
 their predictions/pipelines without the runtime ever opening a legacy store.
 
-> Status: **scaffold** (lane `L18`, lock `LOCK-MIG`, decision `DEC-MIG-001`).
+> Status: **first transform** (lane `L18`, lock `LOCK-MIG`, decision `DEC-MIG-001`).
 > The CLI surface, the no-in-place safety machinery, detection, the contract
 > vocabulary, `inspect`, `migrate --dry-run`, and `--copy-only` are implemented.
-> The schema-transform engine (legacy reader → v2 store) is a marked stub.
+> The first schema transform lowers `sqlite-workspace-legacy-arrays` metadata
+> into a fresh workspace-v2 `store.sqlite`; legacy array rows are preserved as
+> checksummed opaque JSONL until Parquet array lowering is implemented.
 
 ## The one contract: no-in-place
 
@@ -50,6 +52,15 @@ nirs4all-tools legacy migrate <input> --output DIR --target nirs4all-workspace-v
 # Verify an output against its manifest (reads no source).
 nirs4all-tools legacy verify <output-dir> --manifest PATH [--report PATH]
 ```
+
+Current schema-transform support is intentionally narrow:
+
+- `sqlite-workspace-legacy-arrays` metadata is lowered to `store.sqlite`
+  schema v2;
+- the legacy `prediction_arrays` table is not executed or loaded into runtime
+  code, and is preserved in `preserved/legacy-prediction-arrays.jsonl`;
+- best-effort migration exits `10` when arrays are preserved opaque;
+- `--strict` refuses that source until full Parquet array lowering lands.
 
 ### Exit codes
 

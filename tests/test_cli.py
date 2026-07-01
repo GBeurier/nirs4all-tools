@@ -78,3 +78,20 @@ def test_migrate_copy_only_then_verify_via_cli(sqlite_v2_workspace: Path, tmp_pa
     )
     code = main(["legacy", "verify", str(out), "--manifest", str(out / "migration-manifest.json")])
     assert code == int(ExitCode.SUCCESS)
+
+
+def test_migrate_sqlite_legacy_arrays_via_cli(sqlite_legacy_arrays_workspace: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    code = main(
+        [
+            "legacy",
+            "migrate",
+            str(sqlite_legacy_arrays_workspace),
+            "--output",
+            str(out),
+            "--verify",
+        ]
+    )
+    assert code == int(ExitCode.MIGRATED_WITH_WARNINGS)
+    assert (out / "store.sqlite").exists()
+    assert (out / "preserved" / "legacy-prediction-arrays.jsonl").exists()

@@ -159,6 +159,96 @@ def test_migrate_real_transform_is_unimplemented_and_safe(sqlite_v2_workspace: P
     assert not out.exists()  # nothing written when the engine refuses
 
 
+def test_migrate_sqlite_legacy_arrays_to_workspace_v2(
+    sqlite_legacy_arrays_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+
+    def run() -> None:
+        code = commands.migrate(
+            sqlite_legacy_arrays_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.MIGRATED_WITH_WARNINGS
+
+    _unchanged(sqlite_legacy_arrays_workspace, run)
+
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+    id_map = json.loads((out / "migration-id-map.json").read_text(encoding="utf-8"))
+
+    store = out / "store.sqlite"
+    preserved = out / "preserved" / "legacy-prediction-arrays.jsonl"
+    assert store.exists()
+    assert preserved.exists()
+    assert "store.sqlite" in manifest["checksums"]
+    assert "preserved/legacy-prediction-arrays.jsonl" in manifest["checksums"]
+    assert manifest["checksums"]["arrays:pred-1"].startswith("sha256:")
+    assert manifest["preserved_opaque"] == [
+        {
+            "path": "preserved/legacy-prediction-arrays.jsonl",
+            "reason": "legacy_prediction_arrays",
+            "checksum": manifest["checksums"]["preserved/legacy-prediction-arrays.jsonl"],
+        }
+    ]
+    assert manifest["unsupported"][0]["disposition"] == "preserved"
+    assert report["status"] == vocab.STATUS_MIGRATED_WITH_WARNINGS
+    assert report["migrated_counts"]["runs"] == 1
+    assert report["migrated_counts"]["pipelines"] == 1
+    assert report["migrated_counts"]["chains"] == 1
+    assert report["migrated_counts"]["predictions"] == 1
+    assert report["migrated_counts"]["arrays"] == 0
+    assert report["verification_summary"]["passed"] is True
+    assert id_map["schema_version"] == 1
+
+
+def test_migrate_sqlite_legacy_arrays_store_is_runtime_v2_shape(
+    sqlite_legacy_arrays_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_legacy_arrays_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    import sqlite3
+
+    con = sqlite3.connect(out / "store.sqlite")
+    try:
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+        assert version == 2
+        tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "prediction_arrays" not in tables
+        assert {"runs", "pipelines", "chains", "predictions", "artifacts", "logs", "projects"} <= tables
+        pred = con.execute(
+            "SELECT prediction_id, dataset_name, model_name, metric, task_type FROM predictions"
+        ).fetchone()
+        assert pred == ("pred-1", "dataset-a", "PLSRegression", "rmse", "regression")
+    finally:
+        con.close()
+
+
+def test_migrate_sqlite_legacy_arrays_strict_refuses_without_output(
+    sqlite_legacy_arrays_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            sqlite_legacy_arrays_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            tool_version="0.0.1",
+        )
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_CAPABILITY
+    assert not out.exists()
+
+
 def test_migrate_refuses_inert_strict_on_copy_only(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
     with pytest.raises(UnsupportedInput) as exc:
         commands.migrate(
