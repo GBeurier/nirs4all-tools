@@ -249,6 +249,84 @@ def test_migrate_sqlite_legacy_arrays_strict_refuses_without_output(
     assert not out.exists()
 
 
+def test_migrate_native_results_preserves_opaque_best_effort(
+    native_results_dir: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+
+    def run() -> None:
+        code = commands.migrate(
+            native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.MIGRATED_WITH_WARNINGS
+
+    _unchanged(native_results_dir, run)
+
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+    preserved_root = out / "preserved" / "native-results-v1" / native_results_dir.name
+
+    assert (out / "store.sqlite").exists()
+    assert (preserved_root / "manifest.json").exists()
+    assert (preserved_root / "score_set.json").exists()
+    assert (preserved_root / "predictions.parquet").exists()
+    assert "store.sqlite" in manifest["checksums"]
+    assert f"preserved/native-results-v1/{native_results_dir.name}/manifest.json" in manifest["checksums"]
+    assert manifest["preserved_opaque"] == [
+        {
+            "path": f"preserved/native-results-v1/{native_results_dir.name}",
+            "reason": "native-results-v1",
+            "checksum": manifest["preserved_opaque"][0]["checksum"],
+        }
+    ]
+    assert manifest["unsupported"][0]["source_kind"] == "native-results-v1"
+    assert manifest["unsupported"][0]["disposition"] == "preserved"
+    assert report["status"] == vocab.STATUS_MIGRATED_WITH_WARNINGS
+    assert report["preserved_counts"]["opaque_artifacts"] == 1
+    assert report["verification_summary"]["passed"] is True
+
+
+def test_migrate_native_results_strict_refuses_without_output(
+    native_results_dir: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            tool_version="0.0.1",
+        )
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_CAPABILITY
+    assert not out.exists()
+
+
+def test_migrate_n4a_bundle_preserves_opaque_best_effort(
+    n4a_bundle: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    code = commands.migrate(
+        n4a_bundle,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        verify=True,
+        tool_version="0.0.1",
+    )
+    assert code == ExitCode.MIGRATED_WITH_WARNINGS
+
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    preserved = out / "preserved" / "n4a-bundle" / n4a_bundle.name
+    assert preserved.exists()
+    assert f"preserved/n4a-bundle/{n4a_bundle.name}" in manifest["checksums"]
+    assert manifest["preserved_opaque"][0]["reason"] == "n4a-bundle"
+    assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
+
+
 def test_migrate_refuses_inert_strict_on_copy_only(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
     with pytest.raises(UnsupportedInput) as exc:
         commands.migrate(

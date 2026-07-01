@@ -59,8 +59,10 @@ Current schema-transform support is intentionally narrow:
   schema v2;
 - the legacy `prediction_arrays` table is not executed or loaded into runtime
   code, and is preserved in `preserved/legacy-prediction-arrays.jsonl`;
+- `.n4a`, `.n4a.py`, and `native-results-v1` artifacts are preserved as opaque
+  checksummed payloads under `preserved/` with an empty workspace-v2 store;
 - best-effort migration exits `10` when arrays are preserved opaque;
-- `--strict` refuses that source until full Parquet array lowering lands.
+- `--strict` refuses those sources until full semantic lowering lands.
 
 ### Exit codes
 
