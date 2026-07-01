@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,19 @@ def test_source_guard_trips_on_modified_bytes(tmp_path: Path) -> None:
     with pytest.raises(SourceIntegrityError):
         with policy.source_guard(src):
             target.write_text("HELLO WORLD", encoding="utf-8")
+
+
+def test_source_guard_trips_on_same_size_modified_bytes_with_restored_mtime(tmp_path: Path) -> None:
+    src = tmp_path / "ws"
+    src.mkdir()
+    target = src / "a.txt"
+    target.write_text("hello", encoding="utf-8")
+    original = target.stat()
+
+    with pytest.raises(SourceIntegrityError):
+        with policy.source_guard(src):
+            target.write_text("HELLO", encoding="utf-8")
+            os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
 
 
 def test_source_guard_integrity_error_outranks_body_error(tmp_path: Path) -> None:

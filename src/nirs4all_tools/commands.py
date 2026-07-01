@@ -150,16 +150,16 @@ def _source_fingerprint(source: Path) -> str:
     root = Path(snapshot.root)
     entries: list[dict[str, Any]] = []
     if root.is_file():
-        size = snapshot.entries.get(".", (root.stat().st_size, 0))[0]
-        entries.append({"kind": "file", "path": ".", "sha256": sha256_file(root), "size": size})
+        st = root.stat()
+        size, _mtime, digest = snapshot.entries.get(".", (st.st_size, st.st_mtime_ns, sha256_file(root)))
+        entries.append({"kind": "file", "path": ".", "sha256": digest, "size": size})
     else:
         for rel in sorted(snapshot.entries):
-            size, _mtime = snapshot.entries[rel]
+            size, _mtime, digest = snapshot.entries[rel]
             if size < 0:
                 entries.append({"kind": "directory" if size == -1 else "unreadable", "path": rel})
                 continue
-            file_path = root / rel
-            entries.append({"kind": "file", "path": rel, "sha256": sha256_file(file_path), "size": size})
+            entries.append({"kind": "file", "path": rel, "sha256": digest, "size": size})
     payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return sha256_bytes(payload)
 
@@ -289,7 +289,7 @@ def _copy_only(source: Path, output: Path, manifest: dict[str, Any]) -> dict[str
         checksums[key] = sha256_file(dest)
         file_count = 1
     else:
-        for rel, (size, _mtime) in snapshot.entries.items():
+        for rel, (size, _mtime, _sha256) in snapshot.entries.items():
             if size < 0:  # directory marker
                 continue
             src_file = src_real / rel

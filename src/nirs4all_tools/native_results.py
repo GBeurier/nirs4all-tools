@@ -135,6 +135,42 @@ def _read_prediction_rows(path: Path) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], table.to_pylist())
 
 
+def _runtime_shape_list(value: Any, *, field: str, row_index: int) -> list[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise UnsupportedInput(
+            f"native-results-v1 predictions.parquet row {row_index} field {field!r} is not a list",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="preserve the native results opaque, or regenerate predictions.parquet",
+        )
+    try:
+        return [int(item) for item in value]
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedInput(
+            f"native-results-v1 predictions.parquet row {row_index} field {field!r} contains a non-integer shape value",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="preserve the native results opaque, or regenerate predictions.parquet",
+        ) from exc
+
+
+def _validate_runtime_array_preview_shapes(prediction_rows: list[dict[str, Any]]) -> None:
+    for index, row in enumerate(prediction_rows):
+        if row.get("arrays_present") is False:
+            continue
+        for field in ("y_true_shape", "y_pred_shape"):
+            shape = _runtime_shape_list(row.get(field), field=field, row_index=index)
+            if shape is not None and len(shape) > 1:
+                raise UnsupportedInput(
+                    f"native-results-v1 predictions.parquet row {index} field {field!r} has shape {shape!r}; "
+                    "workspace-v2 sidecars preserve only flat y_true/y_pred arrays",
+                    cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                    mitigation=(
+                        "preserve the native results opaque until workspace-v2 records y_true/y_pred shape metadata"
+                    ),
+                )
+
+
 def load_native_results_preview(run_dir: Path) -> NativeResultsPreview:
     """Validate and load one native-results-v1 directory for preview lowering."""
 
@@ -185,6 +221,7 @@ def load_native_results_preview(run_dir: Path) -> NativeResultsPreview:
             cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
             mitigation="preserve the native results opaque; manifest and predictions.parquet disagree",
         )
+    _validate_runtime_array_preview_shapes(prediction_rows)
 
     return NativeResultsPreview(
         run_dir=run_dir,
@@ -270,6 +307,11 @@ def _numeric_list(value: Any, *, field: str, dtype: type[float] | type[int]) -> 
         ) from exc
 
 
+def _optional_numeric_list(value: Any, *, field: str, dtype: type[float] | type[int]) -> list[Any] | None:
+    values = _numeric_list(value, field=field, dtype=dtype)
+    return values or None
+
+
 def runtime_array_records_from_native_results(preview: NativeResultsPreview) -> list[dict[str, Any]]:
     """Return runtime workspace-v2 array records from native prediction rows."""
 
@@ -292,10 +334,10 @@ def runtime_array_records_from_native_results(preview: NativeResultsPreview) -> 
                 "task_type": _first_string(row.get("task_type"), task_type_default, default="unknown"),
                 "y_true": _numeric_list(row.get("y_true"), field="y_true", dtype=float),
                 "y_pred": _numeric_list(row.get("y_pred"), field="y_pred", dtype=float),
-                "y_proba": _numeric_list(row.get("y_proba"), field="y_proba", dtype=float),
-                "y_proba_shape": _numeric_list(row.get("y_proba_shape"), field="y_proba_shape", dtype=int),
-                "sample_indices": _numeric_list(row.get("sample_indices"), field="sample_indices", dtype=int),
-                "weights": _numeric_list(row.get("weights"), field="weights", dtype=float),
+                "y_proba": _optional_numeric_list(row.get("y_proba"), field="y_proba", dtype=float),
+                "y_proba_shape": _optional_numeric_list(row.get("y_proba_shape"), field="y_proba_shape", dtype=int),
+                "sample_indices": _optional_numeric_list(row.get("sample_indices"), field="sample_indices", dtype=int),
+                "weights": _optional_numeric_list(row.get("weights"), field="weights", dtype=float),
                 "sample_metadata": None,
             }
         )

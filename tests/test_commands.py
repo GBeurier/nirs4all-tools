@@ -22,6 +22,18 @@ def _unchanged(source: Path, body) -> None:
     assert policy.diff_snapshots(before, after) == []
 
 
+def _mark_native_results_as_multidimensional(path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    predictions = path / "predictions.parquet"
+    table = pq.read_table(predictions)
+    rows = table.to_pylist()
+    rows[0]["y_pred_shape"] = [3, 1]
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), predictions)
+
+
 # --- inspect ---------------------------------------------------------------
 def test_inspect_recognized_returns_success(sqlite_v2_workspace: Path, capsys: pytest.CaptureFixture[str]) -> None:
     code = commands.inspect(sqlite_v2_workspace, fmt="json")
@@ -423,6 +435,98 @@ def test_migrate_native_results_preserves_opaque_best_effort(
     assert report["verification_summary"]["passed"] is True
 
 
+def test_migrate_native_results_multidimensional_arrays_dry_run_would_preserve(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    _mark_native_results_as_multidimensional(lowerable_native_results_dir)
+    out = tmp_path / "out"
+    manifest_path = tmp_path / "preview-manifest.json"
+    unsupported_path = tmp_path / "unsupported-report.json"
+
+    def run() -> None:
+        code = commands.migrate(
+            lowerable_native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            manifest_path=manifest_path,
+            unsupported_report_path=unsupported_path,
+            dry_run=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.SUCCESS
+
+    _unchanged(lowerable_native_results_dir, run)
+
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert not out.exists()
+    assert unsupported["counts"]["unsupported"] == 1
+    assert unsupported["unsupported"] == manifest["unsupported"]
+    assert unsupported["unsupported"][0]["source_kind"] == "native-results-v1"
+    assert unsupported["unsupported"][0]["disposition"] == "would_preserve"
+    assert unsupported["unsupported"][0]["cause"] == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "workspace-v2 sidecars preserve only flat" in unsupported["unsupported"][0]["reason"]
+
+
+def test_migrate_native_results_multidimensional_arrays_preserves_opaque_best_effort(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    _mark_native_results_as_multidimensional(lowerable_native_results_dir)
+    out = tmp_path / "out"
+
+    def run() -> None:
+        code = commands.migrate(
+            lowerable_native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.MIGRATED_WITH_WARNINGS
+
+    _unchanged(lowerable_native_results_dir, run)
+
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+    unsupported = json.loads((out / "unsupported-report.json").read_text(encoding="utf-8"))
+    preserved_root = out / "preserved" / "native-results-v1" / lowerable_native_results_dir.name
+
+    assert (out / "store.sqlite").exists()
+    assert not (out / "arrays").exists()
+    assert (preserved_root / "predictions.parquet").exists()
+    assert manifest["unsupported"][0]["source_kind"] == "native-results-v1"
+    assert manifest["unsupported"][0]["disposition"] == "preserved"
+    assert manifest["unsupported"][0]["cause"] == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "workspace-v2 sidecars preserve only flat" in manifest["unsupported"][0]["reason"]
+    assert unsupported["unsupported"] == manifest["unsupported"]
+    assert report["status"] == vocab.STATUS_MIGRATED_WITH_WARNINGS
+    assert report["preserved_counts"]["opaque_artifacts"] == 1
+    assert report["verification_summary"]["passed"] is True
+
+
+def test_migrate_native_results_multidimensional_arrays_strict_refuses_without_output(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    _mark_native_results_as_multidimensional(lowerable_native_results_dir)
+    out = tmp_path / "out"
+
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            lowerable_native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            tool_version="0.0.1",
+        )
+
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "workspace-v2 sidecars preserve only flat" in exc.value.message
+    assert not out.exists()
+
+
 def test_migrate_native_results_lowers_preview_metadata(
     lowerable_native_results_dir: Path, tmp_path: Path
 ) -> None:
@@ -507,10 +611,10 @@ def test_migrate_native_results_lowers_preview_metadata(
         "task_type": "regression",
         "y_true": [1.0, 2.0, 3.0],
         "y_pred": [1.1, 1.9, 3.2],
-        "y_proba": [],
-        "y_proba_shape": [],
+        "y_proba": None,
+        "y_proba_shape": None,
         "sample_indices": [0, 1, 2],
-        "weights": [],
+        "weights": None,
         "sample_metadata": None,
     }
 

@@ -8,8 +8,8 @@ This module enforces, *before any byte is written*, the rules from
 * the output must be empty unless ``--resume`` (``assert_output_available``);
 * explicit report/manifest paths must resolve **outside** the source tree
   (``assert_path_outside_source``);
-* the whole source tree is snapshotted ``(path, size, mtime_ns)`` before and
-  after every run and asserted byte-for-byte identical (``source_guard``).
+* the whole source tree is snapshotted ``(path, size, mtime_ns, sha256)`` before
+  and after every run and asserted byte-for-byte identical (``source_guard``).
 
 All refusals raise :class:`PolicyRefusal` (exit ``40``); a tripped integrity
 assertion raises :class:`SourceIntegrityError` (exit ``70``).
@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import vocab
+from .checksums import sha256_file
 from .errors import PolicyRefusal, SourceIntegrityError
 
 
@@ -122,29 +123,29 @@ def assert_output_available(output: Path, *, resume: bool) -> None:
 
 @dataclass(frozen=True)
 class TreeSnapshot:
-    """An ordered ``(relative path -> (size, mtime_ns))`` map of a tree.
+    """An ordered ``(relative path -> (size, mtime_ns, sha256))`` map of a tree.
 
     Directories are recorded with ``size == -1`` so that an added or removed
     empty directory is still detected.
     """
 
     root: Path
-    entries: dict[str, tuple[int, int]] = field(default_factory=dict)
+    entries: dict[str, tuple[int, int, str | None]] = field(default_factory=dict)
 
 
 def snapshot_tree(root: Path) -> TreeSnapshot:
-    """Snapshot ``(size, mtime_ns)`` for every path under ``root``.
+    """Snapshot ``(size, mtime_ns, sha256)`` for every path under ``root``.
 
     Works for both a single file and a directory tree. A missing root yields an
     empty snapshot rather than raising, so the guard can run on abort paths.
     """
     root = realpath(root)
-    entries: dict[str, tuple[int, int]] = {}
+    entries: dict[str, tuple[int, int, str | None]] = {}
     if not root.exists():
         return TreeSnapshot(root=root, entries=entries)
     if root.is_file():
         st = root.stat()
-        entries["."] = (st.st_size, st.st_mtime_ns)
+        entries["."] = (st.st_size, st.st_mtime_ns, sha256_file(root))
         return TreeSnapshot(root=root, entries=entries)
     for dirpath, dirnames, filenames in os.walk(root):
         base = Path(dirpath)
@@ -152,17 +153,17 @@ def snapshot_tree(root: Path) -> TreeSnapshot:
             p = base / name
             rel = os.path.relpath(p, root)
             try:
-                entries[rel] = (-1, p.stat().st_mtime_ns)
+                entries[rel] = (-1, p.stat().st_mtime_ns, None)
             except OSError:
-                entries[rel] = (-1, 0)
+                entries[rel] = (-1, 0, None)
         for name in filenames:
             p = base / name
             rel = os.path.relpath(p, root)
             try:
                 st = p.stat()
-                entries[rel] = (st.st_size, st.st_mtime_ns)
+                entries[rel] = (st.st_size, st.st_mtime_ns, sha256_file(p))
             except OSError:
-                entries[rel] = (-2, 0)
+                entries[rel] = (-2, 0, None)
     return TreeSnapshot(root=root, entries=entries)
 
 
