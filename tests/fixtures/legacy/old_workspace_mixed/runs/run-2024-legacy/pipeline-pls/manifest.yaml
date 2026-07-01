@@ -1,0 +1,13 @@
+run_id: run-2024-legacy
+pipeline_id: pipeline-pls
+dataset: cassava-drymatter-2024
+engine: legacy-sklearn
+status: completed
+model:
+  class: sklearn.cross_decomposition.PLSRegression
+  name: PLSRegression
+preprocessing:
+  - SNV
+  - SavitzkyGolay
+predictions:
+  file: ../../../run_predictions.json

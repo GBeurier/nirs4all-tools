@@ -1,0 +1,10 @@
+{
+  "run_id": "run-2024-legacy",
+  "pipeline_id": "pipeline-pls",
+  "prediction_id": "pred-loose-001",
+  "dataset": "cassava-drymatter-2024",
+  "partition": "validation",
+  "metric": "rmse",
+  "y_true": [31.2, 29.8, 33.5],
+  "y_pred": [31.0, 30.1, 33.0]
+}
