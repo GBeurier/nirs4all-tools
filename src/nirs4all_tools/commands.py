@@ -34,7 +34,12 @@ from .detect import (
 )
 from .errors import UnsupportedInput, VerificationFailed
 from .exit_codes import ExitCode
-from .native_results import NativeResultsPreview, load_native_results_preview, lower_native_results_preview
+from .native_results import (
+    NativeResultsPreview,
+    load_native_results_preview,
+    lower_native_results_preview,
+    runtime_array_records_from_native_results,
+)
 from .policy import (
     assert_disjoint,
     assert_output_available,
@@ -64,6 +69,23 @@ _PREDICTION_ARRAY_METADATA_COLUMNS = (
 )
 _OPAQUE_PRESERVABLE_KINDS = frozenset({KIND_NATIVE_RESULTS_V1, KIND_N4A_BUNDLE, KIND_N4A_PY_BUNDLE})
 _UNSAFE_ARRAY_FILENAME_RE = re.compile(r'[/\\:*?"<>|\s.]+')
+_RUNTIME_ARRAY_RECORD_FIELDS = (
+    "prediction_id",
+    "dataset_name",
+    "model_name",
+    "fold_id",
+    "partition",
+    "metric",
+    "val_score",
+    "task_type",
+    "y_true",
+    "y_pred",
+    "y_proba",
+    "y_proba_shape",
+    "sample_indices",
+    "weights",
+    "sample_metadata",
+)
 
 
 def _now_iso() -> str:
@@ -486,15 +508,20 @@ def _pyarrow_runtime_array_schema() -> tuple[Any, Any, Any] | None:
     return pa, pq, schema
 
 
-def _write_runtime_legacy_arrays(
+def _runtime_array_record_checksum(record: dict[str, Any]) -> str:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return sha256_bytes(payload.encode("utf-8"))
+
+
+def _write_runtime_array_records(
     output: Path,
-    rows: list[dict[str, Any]],
+    records: list[dict[str, Any]],
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Lower legacy arrays to runtime-readable Parquet sidecars."""
+    """Write normalized runtime array records to Parquet sidecars."""
     arrow = _pyarrow_runtime_array_schema()
     if arrow is None:
         raise UnsupportedInput(
-            "semantic lowering of legacy prediction_arrays requires the optional pyarrow dependency",
+            "runtime Parquet array sidecar lowering requires the optional pyarrow dependency",
             cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
             mitigation=(
                 'install nirs4all-tools with the "parquet" extra, '
@@ -503,7 +530,15 @@ def _write_runtime_legacy_arrays(
         )
     pa, pq, schema = arrow
 
-    records = [_normalise_runtime_array_record(row) for row in rows]
+    for record in records:
+        missing = [field for field in _RUNTIME_ARRAY_RECORD_FIELDS if field not in record]
+        if missing:
+            raise UnsupportedInput(
+                "runtime array sidecar record is missing field(s): " + ", ".join(missing),
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="preserve the source opaque, or update nirs4all-tools for this array shape",
+            )
+
     grouped: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         filename = _sanitize_array_filename(str(record["dataset_name"]))
@@ -530,9 +565,17 @@ def _write_runtime_legacy_arrays(
         )
 
     for record in records:
-        payload = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        checksums[f"arrays:{record['prediction_id']}"] = sha256_bytes(payload.encode("utf-8"))
+        checksums[f"arrays:{record['prediction_id']}"] = _runtime_array_record_checksum(record)
     return checksums, inventory
+
+
+def _write_runtime_legacy_arrays(
+    output: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    """Lower legacy arrays to runtime-readable Parquet sidecars."""
+    records = [_normalise_runtime_array_record(row) for row in rows]
+    return _write_runtime_array_records(output, records)
 
 
 def _artifact_source_path(input_path: Path, art: DetectedArtifact) -> Path:
@@ -988,7 +1031,7 @@ def _run_native_results_preview_transform(
     *,
     verify_after: bool = False,
 ) -> ExitCode:
-    """Lower one validated native-results-v1 directory to workspace-v2 metadata."""
+    """Lower one validated native-results-v1 directory to workspace-v2 output."""
     created = not output.exists()
     try:
         output.mkdir(parents=True, exist_ok=True)
@@ -1005,7 +1048,9 @@ def _run_native_results_preview_transform(
         source = _artifact_source_path(input_path, artifact)
         rel = _artifact_preserved_rel(input_path, artifact)
         artifact_checksums = _copy_preserved_artifact(source, output / rel, rel)
-        checksums = {"store.sqlite": sha256_file(target_store), **artifact_checksums}
+        native_array_records = runtime_array_records_from_native_results(preview)
+        runtime_array_checksums, runtime_array_inventory = _write_runtime_array_records(output, native_array_records)
+        checksums = {"store.sqlite": sha256_file(target_store), **runtime_array_checksums, **artifact_checksums}
 
         manifest["checksums"] = checksums
         manifest["output_inventory"] = [
@@ -1019,6 +1064,7 @@ def _run_native_results_preview_transform(
                     contracts.DEFAULT_ID_MAP_NAME,
                 ],
             },
+            *runtime_array_inventory,
             {
                 "path": rel,
                 "tables": {},
@@ -1035,7 +1081,8 @@ def _run_native_results_preview_transform(
         }
         report["target_summary"]["kind"] = vocab.TARGET_WORKSPACE_V2
         report["target_summary"]["preview"] = {
-            "native_results_metadata_only": True,
+            "native_results_metadata_only": False,
+            "native_results_array_sidecars": bool(native_array_records),
             "source_payload_preserved": rel,
         }
         report["migrated_counts"].update(
@@ -1045,7 +1092,7 @@ def _run_native_results_preview_transform(
                 "chains": target_counts["chains"],
                 "predictions": target_counts["predictions"],
                 "artifacts": target_counts["artifacts"],
-                "arrays": 0,
+                "arrays": len(native_array_records),
             }
         )
         report["preserved_counts"]["native_payloads"] = 1
@@ -1197,6 +1244,133 @@ def _iter_output_files(output_dir: Path, exclude: set[str]) -> list[str]:
     return files
 
 
+def _sqlite_workspace_v2_verification(
+    output_dir: Path, file_entries: dict[str, Any]
+) -> tuple[dict[str, Any], set[str] | None]:
+    """Verify the generated workspace-v2 SQLite store when one is present."""
+    check: dict[str, Any] = {
+        "ran": False,
+        "status": "not_applicable",
+        "integrity_check": None,
+        "user_version": None,
+        "prediction_ids": 0,
+        "errors": [],
+    }
+    if "store.sqlite" not in file_entries:
+        return check, None
+
+    check["ran"] = True
+    prediction_ids: set[str] = set()
+    try:
+        conn = sqlite3.connect(read_only_sqlite_uri(output_dir / "store.sqlite"), uri=True)
+        try:
+            integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
+            integrity = str(integrity_row[0]) if integrity_row else ""
+            user_version_row = conn.execute("PRAGMA user_version").fetchone()
+            user_version = int(user_version_row[0]) if user_version_row else None
+            check["integrity_check"] = integrity
+            check["user_version"] = user_version
+            if integrity != "ok":
+                check["errors"].append(f"PRAGMA integrity_check returned {integrity!r}")
+            if user_version != contracts.WORKSPACE_V2_USER_VERSION:
+                check["errors"].append(
+                    f"PRAGMA user_version is {user_version!r}, expected {contracts.WORKSPACE_V2_USER_VERSION}"
+                )
+            if "predictions" in _sqlite_tables(conn) and "prediction_id" in _sqlite_columns(conn, "predictions"):
+                prediction_ids = {str(row[0]) for row in conn.execute("SELECT prediction_id FROM predictions")}
+                check["prediction_ids"] = len(prediction_ids)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        check["errors"].append(f"could not verify store.sqlite: {exc}")
+
+    check["status"] = "passed" if not check["errors"] else "failed"
+    return check, prediction_ids
+
+
+def _array_checksum_verification(
+    output_dir: Path,
+    checksums: dict[str, Any],
+    file_entries: dict[str, Any],
+    prediction_ids: set[str] | None,
+) -> dict[str, Any]:
+    """Verify every runtime array row checksum recorded in the manifest."""
+    expected = {key.removeprefix("arrays:"): value for key, value in checksums.items() if key.startswith("arrays:")}
+    sidecar_paths = sorted(
+        rel for rel in file_entries if rel.startswith(f"{_ARRAYS_DIRNAME}/") and rel.endswith(".parquet")
+    )
+    check: dict[str, Any] = {
+        "status": "not_applicable",
+        "sidecar_files": sidecar_paths,
+        "expected_rows": len(expected),
+        "sidecar_rows": 0,
+        "missing_rows": [],
+        "missing_checksums": [],
+        "mismatched_rows": [],
+        "duplicate_rows": [],
+        "metadata_missing_prediction_ids": [],
+        "errors": [],
+        "failure_count": 0,
+    }
+    if not expected and not sidecar_paths:
+        return check
+
+    arrow = _pyarrow_runtime_array_schema()
+    if arrow is None:
+        check["status"] = "failed"
+        check["errors"].append("pyarrow is required to verify runtime array sidecars")
+        check["failure_count"] = 1
+        return check
+    _pa, pq, _schema = arrow
+
+    records: dict[str, dict[str, Any]] = {}
+    for rel in sidecar_paths:
+        path = output_dir / rel
+        if not path.is_file():
+            continue
+        try:
+            table = pq.read_table(path)
+        except Exception as exc:  # noqa: BLE001 - pyarrow raises several concrete parse errors.
+            check["errors"].append(f"could not read {rel}: {exc}")
+            continue
+        for row in table.to_pylist():
+            if not isinstance(row, dict):
+                check["errors"].append(f"{rel} contains a non-object row")
+                continue
+            prediction_id = row.get("prediction_id")
+            if not isinstance(prediction_id, str) or not prediction_id:
+                check["errors"].append(f"{rel} contains a row without prediction_id")
+                continue
+            if prediction_id in records:
+                check["duplicate_rows"].append(prediction_id)
+                continue
+            records[prediction_id] = {field: row.get(field) for field in _RUNTIME_ARRAY_RECORD_FIELDS}
+
+    actual_ids = set(records)
+    expected_ids = set(expected)
+    check["sidecar_rows"] = len(records)
+    check["missing_rows"] = sorted(expected_ids - actual_ids)
+    check["missing_checksums"] = sorted(actual_ids - expected_ids)
+    check["mismatched_rows"] = sorted(
+        prediction_id
+        for prediction_id in expected_ids & actual_ids
+        if _runtime_array_record_checksum(records[prediction_id]) != expected[prediction_id]
+    )
+    if prediction_ids is not None:
+        check["metadata_missing_prediction_ids"] = sorted(actual_ids - prediction_ids)
+
+    check["failure_count"] = (
+        len(check["missing_rows"])
+        + len(check["missing_checksums"])
+        + len(check["mismatched_rows"])
+        + len(check["duplicate_rows"])
+        + len(check["metadata_missing_prediction_ids"])
+        + len(check["errors"])
+    )
+    check["status"] = "passed" if check["failure_count"] == 0 else "failed"
+    return check
+
+
 def _verification_summary_from_manifest(
     output_dir: Path, manifest: dict[str, Any], exclude_names: set[str] | None = None
 ) -> dict[str, Any]:
@@ -1222,21 +1396,30 @@ def _verification_summary_from_manifest(
     if exclude_names is not None:
         exclude.update(exclude_names)
     orphans = [rel for rel in _iter_output_files(output_dir, exclude) if rel not in file_entries]
+    sqlite_check, prediction_ids = _sqlite_workspace_v2_verification(output_dir, file_entries)
+    array_check = _array_checksum_verification(output_dir, checksums, file_entries, prediction_ids)
 
     checks = {
         "manifest_checksums_present": len(file_entries),
         "missing_files": missing,
         "mismatched_files": mismatched,
         "orphan_files": orphans,
-        "sqlite_integrity_check": "skipped (scaffold)",
-        "array_checksum_coverage": "skipped (scaffold)",
+        "sqlite_integrity_check": sqlite_check,
+        "array_checksum_coverage": array_check,
     }
-    passed = not missing and not mismatched and not orphans
+    mismatches = (
+        len(missing)
+        + len(mismatched)
+        + len(orphans)
+        + len(sqlite_check["errors"])
+        + int(array_check["failure_count"])
+    )
+    passed = mismatches == 0
     return {
         "ran": True,
         "passed": passed,
         "checks": checks,
-        "mismatches": len(missing) + len(mismatched) + len(orphans),
+        "mismatches": mismatches,
     }
 
 
@@ -1244,11 +1427,15 @@ def _raise_if_verification_failed(summary: dict[str, Any]) -> None:
     if summary["passed"]:
         return
     checks = summary["checks"]
+    sqlite_failures = len(checks["sqlite_integrity_check"]["errors"])
+    array_failures = int(checks["array_checksum_coverage"]["failure_count"])
     raise VerificationFailed(
         "verification failed: "
         f"{len(checks['missing_files'])} missing, "
         f"{len(checks['mismatched_files'])} mismatched, "
-        f"{len(checks['orphan_files'])} orphan file(s)",
+        f"{len(checks['orphan_files'])} orphan file(s), "
+        f"{sqlite_failures} sqlite failure(s), "
+        f"{array_failures} array failure(s)",
         cause=vocab.CAUSE_VERIFICATION_FAILED,
         mitigation="re-run the migration; the output does not match its manifest",
     )

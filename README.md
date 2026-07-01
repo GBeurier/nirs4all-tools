@@ -18,7 +18,7 @@ their predictions/pipelines without the runtime ever opening a legacy store.
 > `parquet` extra is installed, and the raw rows are still preserved as
 > checksummed JSONL audit provenance. A native-results-v1 preview can lower one
 > current dag-ml native results directory into runtime-readable workspace-v2
-> metadata after strict hash/schema preflight.
+> metadata plus array sidecars after strict hash/schema preflight.
 
 ## The one contract: no-in-place
 
@@ -67,8 +67,9 @@ Current schema-transform support is intentionally narrow:
   in `preserved/legacy-prediction-arrays.jsonl` for audit;
 - one standalone current dag-ml `native-results-v1` directory with a valid
   `score_set_hash` and canonical `predictions.parquet` projection is lowered to
-  workspace-v2 run/pipeline/chain/prediction/artifact metadata; the original
-  native payload is still checksummed under `preserved/native-results-v1/`;
+  workspace-v2 run/pipeline/chain/prediction/artifact metadata plus
+  runtime-readable `arrays/<dataset>.parquet` sidecars; the original native
+  payload is still checksummed under `preserved/native-results-v1/`;
 - malformed, older, mixed, or multi-artifact `native-results-v1` sources fail
   `--strict` with a machine-checkable schema/preflight cause, and best-effort
   mode preserves them opaque with the same reason in the manifest;

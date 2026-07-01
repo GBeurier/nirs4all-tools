@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from nirs4all_tools import commands, policy, vocab
+from nirs4all_tools.checksums import sha256_file
 from nirs4all_tools.errors import PolicyRefusal, UnsupportedInput, VerificationFailed
 from nirs4all_tools.exit_codes import ExitCode
 
@@ -352,14 +353,17 @@ def test_migrate_native_results_lowers_preview_metadata(
     manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
     report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
     preserved_root = out / "preserved" / "native-results-v1" / lowerable_native_results_dir.name
+    arrays = out / "arrays" / "dataset-a.parquet"
 
     assert (out / "store.sqlite").exists()
+    assert arrays.exists()
     assert (preserved_root / "manifest.json").exists()
     assert (preserved_root / "score_set.json").exists()
     assert (preserved_root / "predictions.parquet").exists()
     assert manifest["preserved_opaque"] == []
     assert manifest["unsupported"] == []
     assert "store.sqlite" in manifest["checksums"]
+    assert "arrays/dataset-a.parquet" in manifest["checksums"]
     assert f"preserved/native-results-v1/{lowerable_native_results_dir.name}/predictions.parquet" in manifest[
         "checksums"
     ]
@@ -368,9 +372,12 @@ def test_migrate_native_results_lowers_preview_metadata(
     assert report["migrated_counts"]["pipelines"] == 1
     assert report["migrated_counts"]["chains"] == 1
     assert report["migrated_counts"]["predictions"] == 1
+    assert report["migrated_counts"]["arrays"] == 1
     assert report["preserved_counts"]["native_payloads"] == 1
-    assert report["target_summary"]["preview"]["native_results_metadata_only"] is True
+    assert report["target_summary"]["preview"]["native_results_metadata_only"] is False
+    assert report["target_summary"]["preview"]["native_results_array_sidecars"] is True
     assert report["verification_summary"]["passed"] is True
+    assert report["verification_summary"]["checks"]["array_checksum_coverage"]["status"] == "passed"
 
     con = sqlite3.connect(out / "store.sqlite")
     try:
@@ -388,6 +395,30 @@ def test_migrate_native_results_lowers_preview_metadata(
         assert pipeline == ("run-native-1", "dataset-a", "completed", "rmse")
     finally:
         con.close()
+
+    pytest.importorskip("pyarrow.parquet")
+    import pyarrow.parquet as pq
+
+    native_row = pq.read_table(arrays).to_pylist()[0]
+    prediction_id = native_row["prediction_id"]
+    assert manifest["checksums"][f"arrays:{prediction_id}"].startswith("sha256:")
+    assert native_row == {
+        "prediction_id": prediction_id,
+        "dataset_name": "dataset-a",
+        "model_name": "PLSRegression",
+        "fold_id": "fold-0",
+        "partition": "val",
+        "metric": "rmse",
+        "val_score": 0.1,
+        "task_type": "regression",
+        "y_true": [1.0, 2.0, 3.0],
+        "y_pred": [1.1, 1.9, 3.2],
+        "y_proba": [],
+        "y_proba_shape": [],
+        "sample_indices": [0, 1, 2],
+        "weights": [],
+        "sample_metadata": None,
+    }
 
 
 def test_migrate_native_results_strict_refuses_without_output(
@@ -527,6 +558,42 @@ def test_verify_detects_orphan_file(sqlite_v2_workspace: Path, tmp_path: Path) -
     (out / "payload" / "surprise.txt").write_text("unlisted", encoding="utf-8")
     with pytest.raises(VerificationFailed):
         commands.verify(out, manifest_path=out / "migration-manifest.json")
+
+
+def test_verify_detects_array_row_checksum_mismatch(
+    sqlite_legacy_arrays_workspace: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_legacy_arrays_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    arrays = out / "arrays" / "dataset-a.parquet"
+    table = pq.read_table(arrays)
+    row = table.to_pylist()[0]
+    row["y_pred"] = [9.9, 9.8, 9.7]
+    pq.write_table(pa.Table.from_pylist([row], schema=table.schema), arrays, compression="zstd", compression_level=3)
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["checksums"]["arrays/dataset-a.parquet"] = sha256_file(arrays)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    coverage = report["verification_summary"]["checks"]["array_checksum_coverage"]
+    assert coverage["status"] == "failed"
+    assert coverage["mismatched_rows"] == ["pred-1"]
 
 
 def test_verify_rejects_unreadable_manifest(tmp_path: Path) -> None:

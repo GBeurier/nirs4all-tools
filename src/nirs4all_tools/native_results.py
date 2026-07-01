@@ -233,6 +233,75 @@ def _sample_count(row: dict[str, Any]) -> int | None:
     return None
 
 
+def _prediction_id(preview: NativeResultsPreview, index: int, row: dict[str, Any]) -> str:
+    run_id = str(preview.manifest["run_id"])
+    dataset = _first_string(row.get("dataset"), default="unknown")
+    config_name = _first_string(row.get("config_name"), row.get("variant_id"), default="native")
+    model_name = _first_string(row.get("model_name"), default="unknown")
+    return _stable_id(
+        "prediction",
+        run_id,
+        index,
+        dataset,
+        config_name,
+        model_name,
+        row.get("partition"),
+        row.get("fold_id"),
+        row.get("refit_context"),
+    )
+
+
+def _numeric_list(value: Any, *, field: str, dtype: type[float] | type[int]) -> list[Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise UnsupportedInput(
+            f"native-results-v1 predictions.parquet field {field!r} is not a list",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="preserve the native results opaque, or regenerate predictions.parquet",
+        )
+    try:
+        return [dtype(item) for item in value]
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedInput(
+            f"native-results-v1 predictions.parquet field {field!r} contains a non-numeric value",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="preserve the native results opaque, or regenerate predictions.parquet",
+        ) from exc
+
+
+def runtime_array_records_from_native_results(preview: NativeResultsPreview) -> list[dict[str, Any]]:
+    """Return runtime workspace-v2 array records from native prediction rows."""
+
+    metric_default = _first_string(preview.manifest.get("metric"))
+    task_type_default = _first_string(preview.manifest.get("task_type"))
+    records: list[dict[str, Any]] = []
+    for index, row in enumerate(preview.prediction_rows):
+        if row.get("arrays_present") is False:
+            continue
+        prediction_id = _prediction_id(preview, index, row)
+        records.append(
+            {
+                "prediction_id": prediction_id,
+                "dataset_name": _first_string(row.get("dataset"), default="unknown"),
+                "model_name": _first_string(row.get("model_name"), default="unknown"),
+                "fold_id": _first_string(row.get("fold_id")),
+                "partition": _first_string(row.get("partition"), default="unknown"),
+                "metric": _first_string(row.get("metric"), metric_default, default="unknown"),
+                "val_score": _optional_float(row.get("val_score")),
+                "task_type": _first_string(row.get("task_type"), task_type_default, default="unknown"),
+                "y_true": _numeric_list(row.get("y_true"), field="y_true", dtype=float),
+                "y_pred": _numeric_list(row.get("y_pred"), field="y_pred", dtype=float),
+                "y_proba": _numeric_list(row.get("y_proba"), field="y_proba", dtype=float),
+                "y_proba_shape": _numeric_list(row.get("y_proba_shape"), field="y_proba_shape", dtype=int),
+                "sample_indices": _numeric_list(row.get("sample_indices"), field="sample_indices", dtype=int),
+                "weights": _numeric_list(row.get("weights"), field="weights", dtype=float),
+                "sample_metadata": None,
+            }
+        )
+    return records
+
+
 def _insert_run(conn: sqlite3.Connection, preview: NativeResultsPreview) -> str:
     manifest = preview.manifest
     run_id = str(manifest["run_id"])
@@ -400,17 +469,7 @@ def lower_native_results_preview(conn: sqlite3.Connection, preview: NativeResult
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _stable_id(
-                    "prediction",
-                    run_id,
-                    index,
-                    dataset,
-                    config_name,
-                    model_name,
-                    row.get("partition"),
-                    row.get("fold_id"),
-                    row.get("refit_context"),
-                ),
+                _prediction_id(preview, index, row),
                 pipeline_id,
                 chain_id,
                 dataset,
@@ -448,4 +507,5 @@ __all__ = [
     "NativeResultsPreview",
     "load_native_results_preview",
     "lower_native_results_preview",
+    "runtime_array_records_from_native_results",
 ]
