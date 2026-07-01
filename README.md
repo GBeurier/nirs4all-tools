@@ -117,6 +117,12 @@ mypy
 pytest
 ```
 
+Checked-in converter goldens live under `tests/fixtures/legacy/`. They are
+small reduced legacy payloads for old workspaces, run/pipeline manifests, and
+prediction arrays. Tests copy or materialize them into temporary directories
+before migration so the source goldens stay read-only and the no-in-place
+contract remains observable.
+
 ## License
 
 Dual-licensed **CeCILL-2.1 OR AGPL-3.0-or-later** (plus commercial), consistent
