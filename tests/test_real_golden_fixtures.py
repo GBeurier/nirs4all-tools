@@ -45,6 +45,15 @@ def _copy_standalone_loose_fixture(tmp_path: Path) -> Path:
     return target
 
 
+def _copy_standalone_legacy_runs_fixture(tmp_path: Path) -> Path:
+    source = FIXTURES / "old_workspace_mixed"
+    target = tmp_path / "standalone_legacy_runs"
+    shutil.copytree(source / "runs", target / "runs")
+    shutil.copy2(source / "run_predictions.json", target / "run_predictions.json")
+    shutil.copy2(source / "sample.meta.parquet", target / "sample.meta.parquet")
+    return target
+
+
 def _assert_source_unchanged(source: Path, before: policy.TreeSnapshot) -> None:
     assert policy.diff_snapshots(before, policy.snapshot_tree(source)) == []
 
@@ -247,6 +256,280 @@ def test_golden_standalone_loose_predictions_lowers_and_preserves_payload(tmp_pa
     assert rows[0]["y_true"] == [31.2, 29.8, 33.5]
     assert rows[0]["y_pred"] == [31.0, 30.1, 33.0]
     assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
+
+
+def test_golden_standalone_legacy_runs_manifest_lowers_predictions(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    import pyarrow.parquet as pq
+
+    source = _copy_standalone_legacy_runs_fixture(tmp_path)
+    out = tmp_path / "out"
+    before = policy.snapshot_tree(source)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        strict=True,
+        verify=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.SUCCESS
+    _assert_source_unchanged(source, before)
+
+    manifest = _read_json(out / "migration-manifest.json")
+    report = _read_json(out / "migration-report.json")
+    unsupported = _read_json(out / "unsupported-report.json")
+    runs_payload = out / "preserved" / "fs-runs-legacy" / "runs"
+    loose_payload = out / "preserved" / "loose-predictions" / source.name
+
+    assert manifest["unsupported"] == []
+    assert manifest["preserved_opaque"] == []
+    assert unsupported["counts"]["unsupported"] == 0
+    assert report["migrated_counts"]["runs"] == 1
+    assert report["migrated_counts"]["pipelines"] == 1
+    assert report["migrated_counts"]["chains"] == 1
+    assert report["migrated_counts"]["predictions"] == 1
+    assert report["migrated_counts"]["arrays"] == 1
+    assert report["target_summary"]["preview"]["manifest_file"] == (
+        "runs/run-2024-legacy/pipeline-pls/manifest.yaml"
+    )
+    assert report["target_summary"]["preview"]["prediction_file"] == "run_predictions.json"
+    assert report["verification_summary"]["passed"] is True
+
+    assert (runs_payload / "run-2024-legacy" / "pipeline-pls" / "manifest.yaml").read_text(
+        encoding="utf-8"
+    ) == (source / "runs" / "run-2024-legacy" / "pipeline-pls" / "manifest.yaml").read_text(encoding="utf-8")
+    assert (loose_payload / "run_predictions.json").read_text(encoding="utf-8") == (
+        source / "run_predictions.json"
+    ).read_text(encoding="utf-8")
+    assert (loose_payload / "sample.meta.parquet").read_bytes() == (source / "sample.meta.parquet").read_bytes()
+    assert "preserved/fs-runs-legacy/runs/run-2024-legacy/pipeline-pls/manifest.yaml" in manifest["checksums"]
+    assert f"preserved/loose-predictions/{source.name}/run_predictions.json" in manifest["checksums"]
+
+    with sqlite3.connect(out / "store.sqlite") as con:
+        row = con.execute(
+            """
+            SELECT pl.run_id, p.pipeline_id, p.dataset_name, p.model_name, p.model_class, p.n_samples
+            FROM predictions p
+            JOIN pipelines pl ON p.pipeline_id = pl.pipeline_id
+            """
+        ).fetchone()
+        assert row == (
+            "run-2024-legacy",
+            "pipeline-pls",
+            "cassava-drymatter-2024",
+            "PLSRegression",
+            "sklearn.cross_decomposition.PLSRegression",
+            3,
+        )
+
+    rows = pq.read_table(out / "arrays" / "cassava-drymatter-2024.parquet").to_pylist()
+    assert rows[0]["prediction_id"] == "pred-loose-001"
+    assert rows[0]["sample_indices"] == [0, 1, 2]
+    assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
+
+
+def test_golden_standalone_legacy_runs_dry_run_reports_lowerable(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    source = _copy_standalone_legacy_runs_fixture(tmp_path)
+    out = tmp_path / "out"
+    manifest_path = tmp_path / "dry-run-manifest.json"
+    report_path = tmp_path / "dry-run-report.json"
+    unsupported_path = tmp_path / "dry-run-unsupported.json"
+    before = policy.snapshot_tree(source)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        manifest_path=manifest_path,
+        report_path=report_path,
+        unsupported_report_path=unsupported_path,
+        dry_run=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.SUCCESS
+    assert not out.exists()
+    _assert_source_unchanged(source, before)
+    manifest = _read_json(manifest_path)
+    report = _read_json(report_path)
+    unsupported = _read_json(unsupported_path)
+    assert manifest["unsupported"] == []
+    assert report["status"] == vocab.STATUS_SUCCESS
+    assert unsupported["counts"] == {"unsupported": 0, "preserved": 0, "refused": 0, "opaque_payloads": 0}
+
+
+def test_golden_legacy_runs_extra_prediction_json_refuses_strict_without_output(tmp_path: Path) -> None:
+    source = _copy_standalone_legacy_runs_fixture(tmp_path)
+    (source / "other_predictions.json").write_text('{"run_id": "other"}\n', encoding="utf-8")
+    out = tmp_path / "out"
+    before = policy.snapshot_tree(source)
+
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            tool_version="0.0.1",
+        )
+
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_CAPABILITY
+    assert "manifest-referenced prediction JSON" in exc.value.message
+    assert not out.exists()
+    _assert_source_unchanged(source, before)
+
+
+def test_golden_legacy_runs_extra_prediction_json_best_effort_preserves_all(
+    tmp_path: Path,
+) -> None:
+    source = _copy_standalone_legacy_runs_fixture(tmp_path)
+    (source / "other_predictions.json").write_text('{"run_id": "other"}\n', encoding="utf-8")
+    out = tmp_path / "out"
+    before = policy.snapshot_tree(source)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        verify=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.MIGRATED_WITH_WARNINGS
+    _assert_source_unchanged(source, before)
+    manifest = _read_json(out / "migration-manifest.json")
+    report = _read_json(out / "migration-report.json")
+    unsupported = _read_json(out / "unsupported-report.json")
+    assert report["verification_summary"]["passed"] is True
+    assert unsupported["counts"]["unsupported"] == 2
+    assert unsupported["counts"]["preserved"] == 2
+    assert {item["source_kind"] for item in unsupported["unsupported"]} == {
+        "fs-runs-legacy",
+        "loose-predictions",
+    }
+    assert {item["disposition"] for item in unsupported["unsupported"]} == {"preserved"}
+    assert unsupported["unsupported"] == manifest["unsupported"]
+    assert (out / "preserved" / "loose-predictions" / source.name / "other_predictions.json").exists()
+    assert not (out / "arrays").exists()
+
+
+def test_golden_legacy_runs_missing_parquet_dry_run_matches_best_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _copy_standalone_legacy_runs_fixture(tmp_path)
+    out = tmp_path / "out"
+    dry_unsupported_path = tmp_path / "dry-run-unsupported.json"
+    before = policy.snapshot_tree(source)
+    monkeypatch.setattr(commands, "_pyarrow_runtime_array_schema", lambda: None)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        unsupported_report_path=dry_unsupported_path,
+        dry_run=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.SUCCESS
+    assert not out.exists()
+    _assert_source_unchanged(source, before)
+    dry_unsupported = _read_json(dry_unsupported_path)
+    assert dry_unsupported["counts"] == {"unsupported": 2, "preserved": 2, "refused": 0, "opaque_payloads": 0}
+
+    real_out = tmp_path / "real-out"
+    code = commands.migrate(
+        source,
+        output=real_out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        verify=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.MIGRATED_WITH_WARNINGS
+    _assert_source_unchanged(source, before)
+    real_unsupported = _read_json(real_out / "unsupported-report.json")
+    assert real_unsupported["counts"]["unsupported"] == dry_unsupported["counts"]["unsupported"]
+    assert real_unsupported["counts"]["preserved"] == dry_unsupported["counts"]["preserved"]
+    assert {item["source_kind"] for item in real_unsupported["unsupported"]} == {
+        "fs-runs-legacy",
+        "loose-predictions",
+    }
+
+
+def test_golden_legacy_runs_manifest_mismatch_refuses_without_output(tmp_path: Path) -> None:
+    source = _copy_standalone_legacy_runs_fixture(tmp_path)
+    manifest = source / "runs" / "run-2024-legacy" / "pipeline-pls" / "manifest.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("pipeline_id: pipeline-pls", "pipeline_id: other-pipeline"),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    before = policy.snapshot_tree(source)
+
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            tool_version="0.0.1",
+        )
+
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "manifest and predictions JSON disagree" in exc.value.message
+    assert not out.exists()
+    _assert_source_unchanged(source, before)
+
+
+def test_golden_legacy_runs_manifest_mismatch_best_effort_matches_dry_run(tmp_path: Path) -> None:
+    source = _copy_standalone_legacy_runs_fixture(tmp_path)
+    manifest = source / "runs" / "run-2024-legacy" / "pipeline-pls" / "manifest.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("pipeline_id: pipeline-pls", "pipeline_id: other-pipeline"),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    dry_unsupported_path = tmp_path / "dry-run-unsupported.json"
+    before = policy.snapshot_tree(source)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        unsupported_report_path=dry_unsupported_path,
+        dry_run=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.SUCCESS
+    assert not out.exists()
+    _assert_source_unchanged(source, before)
+    dry_unsupported = _read_json(dry_unsupported_path)
+    assert dry_unsupported["counts"] == {"unsupported": 2, "preserved": 2, "refused": 0, "opaque_payloads": 0}
+
+    real_out = tmp_path / "real-out"
+    code = commands.migrate(
+        source,
+        output=real_out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        verify=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.MIGRATED_WITH_WARNINGS
+    _assert_source_unchanged(source, before)
+    real_unsupported = _read_json(real_out / "unsupported-report.json")
+    assert real_unsupported["counts"]["unsupported"] == dry_unsupported["counts"]["unsupported"]
+    assert real_unsupported["counts"]["preserved"] == dry_unsupported["counts"]["preserved"]
+    assert {item["source_kind"] for item in real_unsupported["unsupported"]} == {
+        "fs-runs-legacy",
+        "loose-predictions",
+    }
 
 
 def test_golden_standalone_loose_predictions_strict_refuses_incomplete_json(tmp_path: Path) -> None:

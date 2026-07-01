@@ -18,7 +18,9 @@ their predictions/pipelines without the runtime ever opening a legacy store.
 > `parquet` extra is installed, and the raw rows are still preserved as
 > checksummed JSONL audit provenance. A native-results-v1 preview can lower one
 > current dag-ml native results directory into runtime-readable workspace-v2
-> metadata plus array sidecars after strict hash/schema preflight.
+> metadata plus array sidecars after strict hash/schema preflight. A legacy
+> `runs/*/*/manifest.yaml` preview can lower one completed run when it references
+> one complete `*_predictions.json` payload and the YAML/JSON metadata agree.
 
 ## The one contract: no-in-place
 
@@ -78,12 +80,17 @@ Current schema-transform support is intentionally narrow:
   runtime-readable `arrays/<dataset>.parquet` sidecars when the `parquet` extra
   is installed; the original loose JSON and sibling metadata files are still
   checksummed under `preserved/loose-predictions/`;
+- one standalone legacy `runs/*/*/manifest.yaml` tree is lowered when its single
+  manifest points to one complete `*_predictions.json` under the same source
+  root and `run_id`, `pipeline_id`, dataset, model, and preprocessing metadata
+  match; the manifest tree and referenced prediction payload remain
+  checksummed under `preserved/`;
 - `.n4a`, `.n4a.py`, and non-lowerable `native-results-v1` artifacts are preserved as opaque
   checksummed payloads under `preserved/` with an empty workspace-v2 store;
 - non-lowerable legacy workspace payloads such as `store.duckdb`, legacy
-  `runs/` trees, incomplete or mixed loose prediction files, and already-v2 SQLite stores are also
-  preserved opaque by default in best-effort mode; `--strict` refuses them
-  before writing;
+  `runs/` trees outside the single-manifest preview, incomplete or mixed loose
+  prediction files, and already-v2 SQLite stores are also preserved opaque by
+  default in best-effort mode; `--strict` refuses them before writing;
 - every real migration writes `unsupported-report.json` alongside the manifest,
   report, and id-map; dry runs write the same machine-readable unsupported
   report only when `--unsupported-report PATH` is provided;

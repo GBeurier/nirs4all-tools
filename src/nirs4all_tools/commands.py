@@ -37,6 +37,13 @@ from .detect import (
 )
 from .errors import UnsupportedInput, VerificationFailed
 from .exit_codes import ExitCode
+from .legacy_runs import (
+    LEGACY_RUNS_PREVIEW_VERSION,
+    LegacyRunsPreview,
+    load_legacy_runs_preview,
+    lower_legacy_runs_preview,
+    runtime_array_records_from_legacy_runs,
+)
 from .loose_predictions import (
     LoosePredictionsPreview,
     load_loose_predictions_preview,
@@ -761,6 +768,37 @@ def _preservable_opaque_artifacts(detection: DetectionResult) -> list[DetectedAr
     return [art for art in detection.artifacts if art.source_kind in _OPAQUE_PRESERVABLE_KINDS]
 
 
+def _legacy_runs_lowering_artifacts(
+    detection: DetectionResult,
+) -> tuple[DetectedArtifact, DetectedArtifact | None] | None:
+    """Return the supported standalone legacy-runs artifact pair, if present."""
+    fs_runs = [art for art in detection.artifacts if art.source_kind == KIND_FS_RUNS_LEGACY]
+    if len(fs_runs) != 1:
+        return None
+    loose = [art for art in detection.artifacts if art.source_kind == KIND_LOOSE_PREDICTIONS]
+    if len(loose) > 1:
+        return None
+    if any(art.source_kind not in {KIND_FS_RUNS_LEGACY, KIND_LOOSE_PREDICTIONS} for art in detection.artifacts):
+        return None
+    return fs_runs[0], loose[0] if loose else None
+
+
+def _legacy_runs_loose_files(loose_artifact: DetectedArtifact | None) -> list[str] | None:
+    if loose_artifact is None:
+        return None
+    files = loose_artifact.details.get("files")
+    if not isinstance(files, list):
+        return []
+    return [str(item) for item in files]
+
+
+def _legacy_runs_artifact_list(
+    fs_runs_artifact: DetectedArtifact,
+    loose_artifact: DetectedArtifact | None,
+) -> list[DetectedArtifact]:
+    return [art for art in (fs_runs_artifact, loose_artifact) if art is not None]
+
+
 def _target_row_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """Return row counts for every workspace-v2 table."""
     return {table: _sqlite_count(conn, table) for table in WORKSPACE_V2_TABLES}
@@ -773,9 +811,34 @@ def _dry_run_unsupported_items(input_path: Path, detection: DetectionResult) -> 
     standalone_native = len(native_artifacts) == 1 and len(detection.artifacts) == 1
     loose_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_LOOSE_PREDICTIONS]
     standalone_loose = len(loose_artifacts) == 1 and len(detection.artifacts) == 1
+    legacy_runs_artifacts = _legacy_runs_lowering_artifacts(detection)
+    legacy_runs_main = legacy_runs_artifacts[0] if legacy_runs_artifacts is not None else None
+    legacy_runs_loose = legacy_runs_artifacts[1] if legacy_runs_artifacts is not None else None
 
     for art in detection.artifacts:
         if art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS:
+            continue
+        if art is legacy_runs_main:
+            try:
+                load_legacy_runs_preview(
+                    input_path,
+                    art.path,
+                    loose_files=_legacy_runs_loose_files(legacy_runs_loose),
+                )
+                if _pyarrow_runtime_array_schema() is None:
+                    raise _runtime_array_sidecar_unavailable()
+            except UnsupportedInput as exc:
+                for preserved_artifact in _legacy_runs_artifact_list(art, legacy_runs_loose):
+                    unsupported.append(
+                        _unsupported_entry(
+                            preserved_artifact,
+                            reason=exc.message,
+                            disposition="would_preserve",
+                            cause=exc.cause,
+                        )
+                    )
+            continue
+        if art is legacy_runs_loose:
             continue
         if art.source_kind == KIND_LOOSE_PREDICTIONS and standalone_loose:
             files = art.details.get("files")
@@ -1025,6 +1088,68 @@ def migrate(
                     mitigation="rerun without --strict to preserve mixed native artifacts opaque",
                 )
         loose_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_LOOSE_PREDICTIONS]
+        legacy_runs_artifacts = _legacy_runs_lowering_artifacts(detection)
+        if legacy_runs_artifacts is not None:
+            fs_runs_artifact, loose_artifact = legacy_runs_artifacts
+            try:
+                legacy_runs_preview = load_legacy_runs_preview(
+                    input_path,
+                    fs_runs_artifact.path,
+                    loose_files=_legacy_runs_loose_files(loose_artifact),
+                )
+            except UnsupportedInput as exc:
+                if strict:
+                    raise
+                return _run_opaque_artifact_preservation(
+                    input_path,
+                    output,
+                    _legacy_runs_artifact_list(fs_runs_artifact, loose_artifact),
+                    manifest,
+                    report,
+                    manifest_path,
+                    report_path,
+                    id_map_path,
+                    unsupported_report_path,
+                    strict=False,
+                    verify_after=verify,
+                    unsupported_reason=exc.message,
+                    unsupported_cause=exc.cause,
+                )
+            missing_sidecar_writer = (
+                _runtime_array_sidecar_unavailable() if _pyarrow_runtime_array_schema() is None else None
+            )
+            if missing_sidecar_writer is not None:
+                if strict:
+                    raise missing_sidecar_writer
+                return _run_opaque_artifact_preservation(
+                    input_path,
+                    output,
+                    _legacy_runs_artifact_list(fs_runs_artifact, loose_artifact),
+                    manifest,
+                    report,
+                    manifest_path,
+                    report_path,
+                    id_map_path,
+                    unsupported_report_path,
+                    strict=False,
+                    verify_after=verify,
+                    unsupported_reason=missing_sidecar_writer.message,
+                    unsupported_cause=missing_sidecar_writer.cause,
+                )
+            return _run_legacy_runs_preview_transform(
+                input_path,
+                output,
+                fs_runs_artifact,
+                loose_artifact,
+                legacy_runs_preview,
+                manifest,
+                report,
+                manifest_path,
+                report_path,
+                id_map_path,
+                unsupported_report_path,
+                verify_after=verify,
+            )
         if loose_artifacts:
             if len(loose_artifacts) == 1 and len(detection.artifacts) == 1:
                 loose_artifact = loose_artifacts[0]
@@ -1443,6 +1568,140 @@ def _run_native_results_preview_transform(
             }
         )
         report["preserved_counts"]["native_payloads"] = 1
+        report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+
+        if manifest_path is not None:
+            _write_json(manifest_path, manifest)
+        _write_unsupported_report(
+            unsupported_report_path,
+            manifest=manifest,
+            report=report,
+            target_path=output,
+        )
+        if verify_after:
+            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            _raise_if_verification_failed(report["verification_summary"])
+        if report_path is not None:
+            _write_json(report_path, report)
+        if id_map_path is not None:
+            _write_json(id_map_path, manifest["old_to_new_ids"])
+        return ExitCode.SUCCESS
+    except Exception:
+        if created and output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+        raise
+
+
+def _run_legacy_runs_preview_transform(
+    input_path: Path,
+    output: Path,
+    fs_runs_artifact: DetectedArtifact,
+    loose_artifact: DetectedArtifact | None,
+    preview: LegacyRunsPreview,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    unsupported_report_path: Path | None,
+    *,
+    verify_after: bool = False,
+) -> ExitCode:
+    """Lower one validated legacy runs manifest to workspace-v2 output."""
+    created = not output.exists()
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        target_store = output / "store.sqlite"
+        target = sqlite3.connect(target_store)
+        try:
+            create_workspace_v2_schema(target)
+            lower_legacy_runs_preview(target, preview)
+            target.commit()
+            target_counts = _target_row_counts(target)
+        finally:
+            target.close()
+
+        runs_rel, runs_checksums = _copy_preserved_detected_artifact(input_path, output, fs_runs_artifact)
+        artifact_checksums = dict(runs_checksums)
+        payload_inventory = [
+            {
+                "path": runs_rel,
+                "tables": {},
+                "row_counts": {"files": len(runs_checksums)},
+                "generated_manifests": [],
+            }
+        ]
+        source_payloads = [runs_rel]
+        if loose_artifact is not None:
+            loose_rel, loose_checksums = _copy_preserved_detected_artifact(input_path, output, loose_artifact)
+            artifact_checksums.update(loose_checksums)
+            payload_inventory.append(
+                {
+                    "path": loose_rel,
+                    "tables": {},
+                    "row_counts": {"files": len(loose_checksums)},
+                    "generated_manifests": [],
+                }
+            )
+            source_payloads.append(loose_rel)
+        else:
+            rel = f"{_PRESERVED_DIRNAME}/{KIND_FS_RUNS_LEGACY}/{preview.prediction_file}"
+            source = input_path / preview.prediction_file
+            dest = output / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest)
+            artifact_checksums[rel] = sha256_file(dest)
+            payload_inventory.append(
+                {
+                    "path": rel,
+                    "tables": {},
+                    "row_counts": {"files": 1},
+                    "generated_manifests": [],
+                }
+            )
+            source_payloads.append(rel)
+
+        array_records = runtime_array_records_from_legacy_runs(preview)
+        runtime_array_checksums, runtime_array_inventory = _write_runtime_array_records(output, array_records)
+        checksums = {"store.sqlite": sha256_file(target_store), **runtime_array_checksums, **artifact_checksums}
+
+        manifest["checksums"] = checksums
+        manifest["output_inventory"] = [
+            {
+                "path": "store.sqlite",
+                "tables": {table: {} for table in WORKSPACE_V2_TABLES},
+                "row_counts": target_counts,
+                "generated_manifests": _generated_contract_names(),
+            },
+            *runtime_array_inventory,
+            *payload_inventory,
+        ]
+        manifest["tool"]["completed_at"] = _now_iso()
+
+        report["status"] = vocab.STATUS_SUCCESS
+        report["source_summary"]["row_counts"] = {
+            "legacy_run_manifests": 1,
+            "loose_prediction_rows": 1,
+        }
+        report["target_summary"]["kind"] = vocab.TARGET_WORKSPACE_V2
+        report["target_summary"]["preview"] = {
+            "legacy_runs_preview_version": LEGACY_RUNS_PREVIEW_VERSION,
+            "manifest_file": preview.manifest_file,
+            "prediction_file": preview.prediction_file,
+            "source_payloads_preserved": source_payloads,
+        }
+        report["migrated_counts"].update(
+            {
+                "runs": target_counts["runs"],
+                "pipelines": target_counts["pipelines"],
+                "chains": target_counts["chains"],
+                "predictions": target_counts["predictions"],
+                "artifacts": target_counts["artifacts"],
+                "arrays": len(array_records),
+            }
+        )
+        report["preserved_counts"]["legacy_run_payloads"] = 1
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
 
         if manifest_path is not None:
