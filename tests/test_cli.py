@@ -92,6 +92,7 @@ def test_migrate_sqlite_legacy_arrays_via_cli(sqlite_legacy_arrays_workspace: Pa
             "--verify",
         ]
     )
-    assert code == int(ExitCode.MIGRATED_WITH_WARNINGS)
+    assert code == int(ExitCode.SUCCESS)
     assert (out / "store.sqlite").exists()
+    assert (out / "arrays" / "dataset-a.parquet").exists()
     assert (out / "preserved" / "legacy-prediction-arrays.jsonl").exists()

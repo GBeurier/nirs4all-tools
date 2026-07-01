@@ -14,6 +14,7 @@ and is not part of this scaffold.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 from datetime import UTC, datetime
@@ -48,9 +49,20 @@ SUPPORT_WINDOW = "nirs4all-tools 0.x — legacy readers supported for an announc
 
 _PAYLOAD_DIRNAME = "payload"
 _PRESERVED_DIRNAME = "preserved"
+_ARRAYS_DIRNAME = "arrays"
 _LEGACY_ARRAYS_JSONL = f"{_PRESERVED_DIRNAME}/legacy-prediction-arrays.jsonl"
 _LEGACY_ARRAY_COLUMNS = ("prediction_id", "y_true", "y_pred", "y_proba", "sample_indices", "weights")
+_PREDICTION_ARRAY_METADATA_COLUMNS = (
+    "dataset_name",
+    "model_name",
+    "fold_id",
+    "partition",
+    "metric",
+    "val_score",
+    "task_type",
+)
 _OPAQUE_PRESERVABLE_KINDS = frozenset({KIND_NATIVE_RESULTS_V1, KIND_N4A_BUNDLE, KIND_N4A_PY_BUNDLE})
+_UNSAFE_ARRAY_FILENAME_RE = re.compile(r'[/\\:*?"<>|\s.]+')
 
 
 def _now_iso() -> str:
@@ -290,7 +302,7 @@ def _create_empty_workspace_v2_store(output: Path) -> tuple[Path, dict[str, int]
 
 
 def _legacy_array_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Return legacy ``prediction_arrays`` rows as dictionaries."""
+    """Return legacy ``prediction_arrays`` rows plus prediction metadata."""
     if "prediction_arrays" not in _sqlite_tables(conn):
         return []
     available = set(_sqlite_columns(conn, "prediction_arrays"))
@@ -299,7 +311,24 @@ def _legacy_array_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         return []
     order = "prediction_id" if "prediction_id" in columns else "rowid"
     rows = conn.execute(f"SELECT {', '.join(columns)} FROM prediction_arrays ORDER BY {order}").fetchall()
-    return [dict(zip(columns, row, strict=True)) for row in rows]
+    records = [dict(zip(columns, row, strict=True)) for row in rows]
+
+    tables = _sqlite_tables(conn)
+    if "predictions" not in tables or "prediction_id" not in _sqlite_columns(conn, "predictions"):
+        return records
+    prediction_columns = _sqlite_columns(conn, "predictions")
+    metadata_columns = [col for col in _PREDICTION_ARRAY_METADATA_COLUMNS if col in prediction_columns]
+    if not metadata_columns:
+        return records
+
+    metadata_sql = ", ".join(["prediction_id", *metadata_columns])
+    metadata = {
+        row[0]: dict(zip(metadata_columns, row[1:], strict=True))
+        for row in conn.execute(f"SELECT {metadata_sql} FROM predictions")
+    }
+    for record in records:
+        record.update(metadata.get(record.get("prediction_id"), {}))
+    return records
 
 
 def _write_preserved_legacy_arrays(output: Path, rows: list[dict[str, Any]]) -> dict[str, str]:
@@ -311,10 +340,198 @@ def _write_preserved_legacy_arrays(output: Path, rows: list[dict[str, Any]]) -> 
         for row in rows:
             payload = json.dumps(row, sort_keys=True, separators=(",", ":"))
             handle.write(payload + "\n")
-            prediction_id = str(row.get("prediction_id") or len(checksums))
-            checksums[f"arrays:{prediction_id}"] = sha256_bytes(payload.encode("utf-8"))
     checksums[_LEGACY_ARRAYS_JSONL] = sha256_file(preserved_path)
     return checksums
+
+
+def _sanitize_array_filename(dataset_name: str) -> str:
+    """Match the runtime ArrayStore dataset filename convention."""
+    sanitized = _UNSAFE_ARRAY_FILENAME_RE.sub("_", dataset_name)
+    return sanitized.strip("_") or "unnamed"
+
+
+def _decode_json_array(value: Any, *, field: str, prediction_id: str) -> Any | None:
+    """Decode one legacy JSON-serialized array cell."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value)
+        except ValueError as exc:
+            raise UnsupportedInput(
+                f"cannot decode legacy prediction_arrays.{field} for {prediction_id!r}: {exc}",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="use --copy-only to preserve this source verbatim, or fix the malformed JSON cell",
+            ) from exc
+    else:
+        parsed = value
+    if parsed is None:
+        return None
+    if not isinstance(parsed, list):
+        raise UnsupportedInput(
+            f"legacy prediction_arrays.{field} for {prediction_id!r} is not an array",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="use --copy-only to preserve this source verbatim, or update nirs4all-tools",
+        )
+    return parsed
+
+
+def _array_shape(value: Any) -> list[int] | None:
+    if value is None:
+        return None
+    shape: list[int] = []
+    cursor = value
+    while isinstance(cursor, list):
+        shape.append(len(cursor))
+        cursor = cursor[0] if cursor else None
+    return shape
+
+
+def _flatten_array(value: Any, *, field: str, prediction_id: str, dtype: type[float] | type[int]) -> list[Any] | None:
+    """Flatten a decoded legacy array and coerce each scalar to ``dtype``."""
+    if value is None:
+        return None
+    flattened: list[Any] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, list):
+            for child in item:
+                visit(child)
+            return
+        try:
+            flattened.append(dtype(item))
+        except (TypeError, ValueError) as exc:
+            raise UnsupportedInput(
+                f"legacy prediction_arrays.{field} for {prediction_id!r} contains a non-numeric value",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="use --copy-only to preserve this source verbatim, or fix the malformed array cell",
+            ) from exc
+
+    visit(value)
+    return flattened
+
+
+def _normalise_runtime_array_record(row: dict[str, Any]) -> dict[str, Any]:
+    """Convert one legacy row into the runtime array-sidecar record shape."""
+    prediction_id = str(row.get("prediction_id") or "")
+    if not prediction_id:
+        raise UnsupportedInput(
+            "legacy prediction_arrays row is missing prediction_id",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="use --copy-only to preserve this source verbatim, or repair the source table",
+        )
+
+    y_true = _decode_json_array(row.get("y_true"), field="y_true", prediction_id=prediction_id)
+    y_pred = _decode_json_array(row.get("y_pred"), field="y_pred", prediction_id=prediction_id)
+    y_proba = _decode_json_array(row.get("y_proba"), field="y_proba", prediction_id=prediction_id)
+    sample_indices = _decode_json_array(row.get("sample_indices"), field="sample_indices", prediction_id=prediction_id)
+    weights = _decode_json_array(row.get("weights"), field="weights", prediction_id=prediction_id)
+
+    return {
+        "prediction_id": prediction_id,
+        "dataset_name": str(row.get("dataset_name") or "unknown"),
+        "model_name": str(row.get("model_name") or ""),
+        "fold_id": str(row.get("fold_id") or ""),
+        "partition": str(row.get("partition") or ""),
+        "metric": str(row.get("metric") or ""),
+        "val_score": row.get("val_score"),
+        "task_type": str(row.get("task_type") or ""),
+        "y_true": _flatten_array(y_true, field="y_true", prediction_id=prediction_id, dtype=float),
+        "y_pred": _flatten_array(y_pred, field="y_pred", prediction_id=prediction_id, dtype=float),
+        "y_proba": _flatten_array(y_proba, field="y_proba", prediction_id=prediction_id, dtype=float),
+        "y_proba_shape": _array_shape(y_proba),
+        "sample_indices": _flatten_array(
+            sample_indices,
+            field="sample_indices",
+            prediction_id=prediction_id,
+            dtype=int,
+        ),
+        "weights": _flatten_array(weights, field="weights", prediction_id=prediction_id, dtype=float),
+        "sample_metadata": None,
+    }
+
+
+def _pyarrow_runtime_array_schema() -> tuple[Any, Any, Any] | None:
+    """Return ``(pa, pq, schema)`` when the optional Parquet dependency exists."""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        return None
+    schema = pa.schema(
+        [
+            ("prediction_id", pa.utf8()),
+            ("dataset_name", pa.utf8()),
+            ("model_name", pa.utf8()),
+            ("fold_id", pa.utf8()),
+            ("partition", pa.utf8()),
+            ("metric", pa.utf8()),
+            ("val_score", pa.float64()),
+            ("task_type", pa.utf8()),
+            ("y_true", pa.list_(pa.float64())),
+            ("y_pred", pa.list_(pa.float64())),
+            ("y_proba", pa.list_(pa.float64())),
+            ("y_proba_shape", pa.list_(pa.int32())),
+            ("sample_indices", pa.list_(pa.int32())),
+            ("weights", pa.list_(pa.float64())),
+            ("sample_metadata", pa.utf8()),
+        ]
+    )
+    return pa, pq, schema
+
+
+def _write_runtime_legacy_arrays(
+    output: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    """Lower legacy arrays to runtime-readable Parquet sidecars."""
+    arrow = _pyarrow_runtime_array_schema()
+    if arrow is None:
+        raise UnsupportedInput(
+            "semantic lowering of legacy prediction_arrays requires the optional pyarrow dependency",
+            cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+            mitigation=(
+                'install nirs4all-tools with the "parquet" extra, '
+                "or rerun without --strict for opaque preservation"
+            ),
+        )
+    pa, pq, schema = arrow
+
+    records = [_normalise_runtime_array_record(row) for row in rows]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        filename = _sanitize_array_filename(str(record["dataset_name"]))
+        grouped.setdefault(filename, []).append(record)
+
+    checksums: dict[str, str] = {}
+    inventory: list[dict[str, Any]] = []
+    arrays_dir = output / _ARRAYS_DIRNAME
+    arrays_dir.mkdir(parents=True, exist_ok=True)
+    schema_names = [field.name for field in schema]
+    for filename, group in sorted(grouped.items()):
+        table = pa.table({name: [record[name] for record in group] for name in schema_names}, schema=schema)
+        rel = f"{_ARRAYS_DIRNAME}/{filename}.parquet"
+        path = output / rel
+        pq.write_table(table, path, compression="zstd", compression_level=3)
+        checksums[rel] = sha256_file(path)
+        inventory.append(
+            {
+                "path": rel,
+                "tables": {},
+                "row_counts": {"arrays": len(group)},
+                "generated_manifests": [],
+            }
+        )
+
+    for record in records:
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        checksums[f"arrays:{record['prediction_id']}"] = sha256_bytes(payload.encode("utf-8"))
+    return checksums, inventory
 
 
 def _artifact_source_path(input_path: Path, art: DetectedArtifact) -> Path:
@@ -594,12 +811,6 @@ def _run_sqlite_legacy_arrays_transform(
     source = sqlite3.connect(read_only_sqlite_uri(store_path), uri=True)
     try:
         legacy_rows = _legacy_array_rows(source)
-        if legacy_rows and strict:
-            raise UnsupportedInput(
-                "strict migration cannot preserve legacy prediction_arrays as opaque JSONL",
-                cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
-                mitigation="rerun without --strict to preserve arrays as opaque provenance, or use --copy-only",
-            )
         created = not output.exists()
         try:
             output.mkdir(parents=True, exist_ok=True)
@@ -613,35 +824,8 @@ def _run_sqlite_legacy_arrays_transform(
                 target.close()
 
             checksums = {"store.sqlite": sha256_file(target_store)}
-            if legacy_rows:
-                preserved_checksums = _write_preserved_legacy_arrays(output, legacy_rows)
-                checksums.update(preserved_checksums)
-                checksum = preserved_checksums[_LEGACY_ARRAYS_JSONL]
-                manifest["preserved_opaque"].append(
-                    {
-                        "path": _LEGACY_ARRAYS_JSONL,
-                        "reason": "legacy_prediction_arrays",
-                        "checksum": checksum,
-                    }
-                )
-                manifest["unsupported"].append(
-                    {
-                        "item": "prediction_arrays",
-                        "reason": "parquet array lowering not implemented in this slice",
-                        "disposition": "preserved",
-                    }
-                )
-                manifest["warnings"].append(
-                    "legacy prediction_arrays preserved as opaque JSONL; not yet lowered to runtime Parquet arrays"
-                )
-                report["warnings"].append(
-                    "legacy prediction_arrays preserved as opaque JSONL; "
-                    "rerun a future tool release for Parquet lowering"
-                )
-                report["unsupported_counts"]["preserved"] = len(legacy_rows)
-
-            manifest["checksums"] = checksums
-            manifest["output_inventory"] = [
+            arrays_lowered = False
+            output_inventory = [
                 {
                     "path": "store.sqlite",
                     "tables": {table: {} for table in WORKSPACE_V2_TABLES},
@@ -653,6 +837,45 @@ def _run_sqlite_legacy_arrays_transform(
                     ],
                 }
             ]
+            if legacy_rows:
+                try:
+                    runtime_array_checksums, runtime_array_inventory = _write_runtime_legacy_arrays(output, legacy_rows)
+                except UnsupportedInput:
+                    if strict:
+                        raise
+                    manifest["unsupported"].append(
+                        {
+                            "item": "prediction_arrays",
+                            "reason": "runtime Parquet array lowering unavailable in this environment",
+                            "disposition": "preserved",
+                        }
+                    )
+                    manifest["warnings"].append(
+                        "legacy prediction_arrays preserved as opaque JSONL; "
+                        "install the parquet extra for semantic lowering"
+                    )
+                    report["warnings"].append(
+                        "legacy prediction_arrays preserved as opaque JSONL; "
+                        "install the parquet extra for semantic lowering"
+                    )
+                    report["unsupported_counts"]["preserved"] = len(legacy_rows)
+                else:
+                    arrays_lowered = True
+                    checksums.update(runtime_array_checksums)
+                    output_inventory.extend(runtime_array_inventory)
+                preserved_checksums = _write_preserved_legacy_arrays(output, legacy_rows)
+                checksums.update(preserved_checksums)
+                checksum = preserved_checksums[_LEGACY_ARRAYS_JSONL]
+                manifest["preserved_opaque"].append(
+                    {
+                        "path": _LEGACY_ARRAYS_JSONL,
+                        "reason": "legacy_prediction_arrays",
+                        "checksum": checksum,
+                    }
+                )
+
+            manifest["checksums"] = checksums
+            manifest["output_inventory"] = output_inventory
             if legacy_rows:
                 manifest["output_inventory"].append(
                     {
@@ -678,11 +901,11 @@ def _run_sqlite_legacy_arrays_transform(
                     "chains": target_counts["chains"],
                     "predictions": target_counts["predictions"],
                     "artifacts": target_counts["artifacts"],
-                    "arrays": 0,
+                    "arrays": len(legacy_rows) if arrays_lowered else 0,
                 }
             )
             report["preserved_counts"]["unknown_columns"] = 0
-            if legacy_rows:
+            if legacy_rows and not arrays_lowered:
                 report["status"] = vocab.STATUS_MIGRATED_WITH_WARNINGS
             else:
                 report["status"] = vocab.STATUS_SUCCESS
@@ -698,7 +921,9 @@ def _run_sqlite_legacy_arrays_transform(
                 _write_json(report_path, report)
             if id_map_path is not None:
                 _write_json(id_map_path, manifest["old_to_new_ids"])
-            return ExitCode.MIGRATED_WITH_WARNINGS if legacy_rows else ExitCode.SUCCESS
+            if legacy_rows and not arrays_lowered:
+                return ExitCode.MIGRATED_WITH_WARNINGS
+            return ExitCode.SUCCESS
         except Exception:
             if created and output.exists():
                 shutil.rmtree(output, ignore_errors=True)

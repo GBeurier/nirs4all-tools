@@ -172,7 +172,7 @@ def test_migrate_sqlite_legacy_arrays_to_workspace_v2(
             verify=True,
             tool_version="0.0.1",
         )
-        assert code == ExitCode.MIGRATED_WITH_WARNINGS
+        assert code == ExitCode.SUCCESS
 
     _unchanged(sqlite_legacy_arrays_workspace, run)
 
@@ -181,10 +181,13 @@ def test_migrate_sqlite_legacy_arrays_to_workspace_v2(
     id_map = json.loads((out / "migration-id-map.json").read_text(encoding="utf-8"))
 
     store = out / "store.sqlite"
+    arrays = out / "arrays" / "dataset-a.parquet"
     preserved = out / "preserved" / "legacy-prediction-arrays.jsonl"
     assert store.exists()
+    assert arrays.exists()
     assert preserved.exists()
     assert "store.sqlite" in manifest["checksums"]
+    assert "arrays/dataset-a.parquet" in manifest["checksums"]
     assert "preserved/legacy-prediction-arrays.jsonl" in manifest["checksums"]
     assert manifest["checksums"]["arrays:pred-1"].startswith("sha256:")
     assert manifest["preserved_opaque"] == [
@@ -194,15 +197,50 @@ def test_migrate_sqlite_legacy_arrays_to_workspace_v2(
             "checksum": manifest["checksums"]["preserved/legacy-prediction-arrays.jsonl"],
         }
     ]
-    assert manifest["unsupported"][0]["disposition"] == "preserved"
-    assert report["status"] == vocab.STATUS_MIGRATED_WITH_WARNINGS
+    assert manifest["unsupported"] == []
+    assert report["status"] == vocab.STATUS_SUCCESS
     assert report["migrated_counts"]["runs"] == 1
     assert report["migrated_counts"]["pipelines"] == 1
     assert report["migrated_counts"]["chains"] == 1
     assert report["migrated_counts"]["predictions"] == 1
-    assert report["migrated_counts"]["arrays"] == 0
+    assert report["migrated_counts"]["arrays"] == 1
     assert report["verification_summary"]["passed"] is True
     assert id_map["schema_version"] == 1
+
+
+def test_migrate_sqlite_legacy_arrays_writes_runtime_parquet(
+    sqlite_legacy_arrays_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_legacy_arrays_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        tool_version="0.0.1",
+    )
+
+    pytest.importorskip("pyarrow.parquet")
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(out / "arrays" / "dataset-a.parquet")
+    row = table.to_pylist()[0]
+    assert row == {
+        "prediction_id": "pred-1",
+        "dataset_name": "dataset-a",
+        "model_name": "PLSRegression",
+        "fold_id": "fold-0",
+        "partition": "val",
+        "metric": "rmse",
+        "val_score": 0.1,
+        "task_type": "regression",
+        "y_true": [1.0, 2.0, 3.0],
+        "y_pred": [1.1, 1.9, 3.2],
+        "y_proba": None,
+        "y_proba_shape": None,
+        "sample_indices": [0, 1, 2],
+        "weights": None,
+        "sample_metadata": None,
+    }
 
 
 def test_migrate_sqlite_legacy_arrays_store_is_runtime_v2_shape(
@@ -233,20 +271,22 @@ def test_migrate_sqlite_legacy_arrays_store_is_runtime_v2_shape(
         con.close()
 
 
-def test_migrate_sqlite_legacy_arrays_strict_refuses_without_output(
+def test_migrate_sqlite_legacy_arrays_strict_lowers_without_warnings(
     sqlite_legacy_arrays_workspace: Path, tmp_path: Path
 ) -> None:
     out = tmp_path / "out"
-    with pytest.raises(UnsupportedInput) as exc:
-        commands.migrate(
-            sqlite_legacy_arrays_workspace,
-            output=out,
-            target=vocab.TARGET_WORKSPACE_V2,
-            strict=True,
-            tool_version="0.0.1",
-        )
-    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_CAPABILITY
-    assert not out.exists()
+    code = commands.migrate(
+        sqlite_legacy_arrays_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        strict=True,
+        verify=True,
+        tool_version="0.0.1",
+    )
+    assert code == ExitCode.SUCCESS
+    report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == vocab.STATUS_SUCCESS
+    assert report["warnings"] == []
 
 
 def test_migrate_native_results_preserves_opaque_best_effort(
