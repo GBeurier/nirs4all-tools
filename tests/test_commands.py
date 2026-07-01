@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -330,6 +331,65 @@ def test_migrate_native_results_preserves_opaque_best_effort(
     assert report["verification_summary"]["passed"] is True
 
 
+def test_migrate_native_results_lowers_preview_metadata(
+    lowerable_native_results_dir: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+
+    def run() -> None:
+        code = commands.migrate(
+            lowerable_native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.SUCCESS
+
+    _unchanged(lowerable_native_results_dir, run)
+
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+    preserved_root = out / "preserved" / "native-results-v1" / lowerable_native_results_dir.name
+
+    assert (out / "store.sqlite").exists()
+    assert (preserved_root / "manifest.json").exists()
+    assert (preserved_root / "score_set.json").exists()
+    assert (preserved_root / "predictions.parquet").exists()
+    assert manifest["preserved_opaque"] == []
+    assert manifest["unsupported"] == []
+    assert "store.sqlite" in manifest["checksums"]
+    assert f"preserved/native-results-v1/{lowerable_native_results_dir.name}/predictions.parquet" in manifest[
+        "checksums"
+    ]
+    assert report["status"] == vocab.STATUS_SUCCESS
+    assert report["migrated_counts"]["runs"] == 1
+    assert report["migrated_counts"]["pipelines"] == 1
+    assert report["migrated_counts"]["chains"] == 1
+    assert report["migrated_counts"]["predictions"] == 1
+    assert report["preserved_counts"]["native_payloads"] == 1
+    assert report["target_summary"]["preview"]["native_results_metadata_only"] is True
+    assert report["verification_summary"]["passed"] is True
+
+    con = sqlite3.connect(out / "store.sqlite")
+    try:
+        row = con.execute(
+            """
+            SELECT pl.run_id, p.dataset_name, p.model_name, p.fold_id, p.partition, p.metric, p.task_type, p.n_samples
+            FROM predictions p
+            JOIN pipelines pl ON p.pipeline_id = pl.pipeline_id
+            """
+        ).fetchone()
+        assert row == ("run-native-1", "dataset-a", "PLSRegression", "fold-0", "val", "rmse", "regression", 3)
+        pipeline = con.execute(
+            "SELECT run_id, dataset_name, status, metric FROM pipelines"
+        ).fetchone()
+        assert pipeline == ("run-native-1", "dataset-a", "completed", "rmse")
+    finally:
+        con.close()
+
+
 def test_migrate_native_results_strict_refuses_without_output(
     native_results_dir: Path, tmp_path: Path
 ) -> None:
@@ -342,7 +402,8 @@ def test_migrate_native_results_strict_refuses_without_output(
             strict=True,
             tool_version="0.0.1",
         )
-    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_CAPABILITY
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "missing manifest field(s): run_id, engine, score_set_hash" in exc.value.message
     assert not out.exists()
 
 

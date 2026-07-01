@@ -16,7 +16,9 @@ their predictions/pipelines without the runtime ever opening a legacy store.
 > into a fresh workspace-v2 `store.sqlite`; legacy array rows are lowered into
 > runtime-readable `arrays/<dataset>.parquet` sidecars when the optional
 > `parquet` extra is installed, and the raw rows are still preserved as
-> checksummed JSONL audit provenance.
+> checksummed JSONL audit provenance. A native-results-v1 preview can lower one
+> current dag-ml native results directory into runtime-readable workspace-v2
+> metadata after strict hash/schema preflight.
 
 ## The one contract: no-in-place
 
@@ -35,6 +37,7 @@ Every command guarantees the source is never modified:
 ```bash
 pip install -e ".[dev]"          # scaffold core is pure standard library
 pip install -e ".[duckdb]"       # add DuckDB-source reading (optional)
+pip install -e ".[parquet]"      # add Parquet lowering/validation (optional)
 ```
 
 ## CLI
@@ -62,12 +65,19 @@ Current schema-transform support is intentionally narrow:
 - the legacy `prediction_arrays` table is decoded offline, lowered to the
   runtime array sidecar schema (`arrays/<dataset>.parquet`), and also preserved
   in `preserved/legacy-prediction-arrays.jsonl` for audit;
-- `.n4a`, `.n4a.py`, and `native-results-v1` artifacts are preserved as opaque
+- one standalone current dag-ml `native-results-v1` directory with a valid
+  `score_set_hash` and canonical `predictions.parquet` projection is lowered to
+  workspace-v2 run/pipeline/chain/prediction/artifact metadata; the original
+  native payload is still checksummed under `preserved/native-results-v1/`;
+- malformed, older, mixed, or multi-artifact `native-results-v1` sources fail
+  `--strict` with a machine-checkable schema/preflight cause, and best-effort
+  mode preserves them opaque with the same reason in the manifest;
+- `.n4a`, `.n4a.py`, and non-lowerable `native-results-v1` artifacts are preserved as opaque
   checksummed payloads under `preserved/` with an empty workspace-v2 store;
 - best-effort migration exits `10` only when semantic lowering is unavailable
-  and arrays must be preserved opaque;
+  and content must be preserved opaque;
 - `--strict` requires semantic lowering and exits `0` for fully lowered array
-  sources.
+  sources or native-results metadata previews.
 
 ### Exit codes
 

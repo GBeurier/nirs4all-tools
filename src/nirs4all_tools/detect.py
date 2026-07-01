@@ -38,7 +38,7 @@ KIND_UNKNOWN: Final = "unknown"
 # --- Versions this build supports (forward-version refusal anchors) --------
 SUPPORTED_SQLITE_USER_VERSION: Final = 2
 SUPPORTED_BUNDLE_FORMAT_VERSION: Final = (1, 0)
-SUPPORTED_NATIVE_MANIFEST_VERSION: Final = 2
+SUPPORTED_NATIVE_MANIFEST_VERSION: Final = 3
 
 #: Note attached to artifacts that are preserved verbatim and never executed.
 _OPAQUE_NOTE: Final = "preserved opaque; never executed"
