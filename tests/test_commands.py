@@ -195,6 +195,43 @@ def test_migrate_dry_run_writes_unsupported_report_for_legacy_workspace(
     assert preview_manifest["unsupported"] == unsupported["unsupported"]
 
 
+def test_migrate_native_results_dry_run_reports_lowerable_preview(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    manifest_path = tmp_path / "preview-manifest.json"
+    report_path = tmp_path / "preview-report.json"
+    unsupported_path = tmp_path / "unsupported-report.json"
+
+    def run() -> None:
+        code = commands.migrate(
+            lowerable_native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            manifest_path=manifest_path,
+            report_path=report_path,
+            unsupported_report_path=unsupported_path,
+            dry_run=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.SUCCESS
+
+    _unchanged(lowerable_native_results_dir, run)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+
+    assert not out.exists()
+    assert manifest["unsupported"] == []
+    assert report["status"] == vocab.STATUS_SUCCESS
+    assert report["target_summary"]["path"] == str(out)
+    assert unsupported["counts"] == {"unsupported": 0, "preserved": 0, "refused": 0, "opaque_payloads": 0}
+    assert unsupported["unsupported"] == []
+    assert any(item["source_kind"] == "native-results-v1" for item in manifest["input_inventory"])
+
+
 # --- migrate: best-effort preservation and transforms ----------------------
 def test_migrate_sqlite_v2_workspace_preserves_opaque_best_effort(
     sqlite_v2_workspace: Path,
