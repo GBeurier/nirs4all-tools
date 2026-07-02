@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  tools-gate:
+    name: nirs4all-tools gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and gate dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,parquet]"
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Typecheck
+        run: mypy
+
+      - name: Tests
+        run: pytest
