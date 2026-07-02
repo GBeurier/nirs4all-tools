@@ -564,6 +564,47 @@ def test_migrate_native_results_multidimensional_arrays_strict_refuses_without_o
     assert not out.exists()
 
 
+def test_migrate_loose_predictions_nonfinite_array_refuses_cleanly(tmp_path: Path) -> None:
+    """A non-finite y_pred is refused as an unsupported shape, never an uncaught crash.
+
+    The runtime sidecar checksum serializes with ``allow_nan=False``; a NaN/Infinity
+    prediction array must surface as a reportable ``UnsupportedInput`` (exit 20) with
+    the source untouched and the tool-created output rolled back — not a bare
+    ``ValueError`` traceback with an undocumented exit code.
+    """
+    pytest.importorskip("pyarrow")
+    src = tmp_path / "loose"
+    src.mkdir()
+    record = {
+        "run_id": "run-1",
+        "pipeline_id": "pipe-1",
+        "prediction_id": "pred-1",
+        "dataset": "dataset-a",
+        "model_name": "PLSRegression",
+        "model_class": "sklearn.cross_decomposition.PLSRegression",
+        "fold_id": "fold-0",
+        "partition": "val",
+        "metric": "rmse",
+        "task_type": "regression",
+        "sample_indices": [0, 1, 2],
+        "y_true": [1.0, 2.0, 3.0],
+        "y_pred": [1.0, float("nan"), 3.0],
+    }
+    # default allow_nan=True writes the bare ``NaN`` token, exactly as legacy runtimes did
+    (src / "run_predictions.json").write_text(json.dumps(record), encoding="utf-8")
+    out = tmp_path / "out"
+
+    before = policy.snapshot_tree(src)
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(src, output=out, target=vocab.TARGET_WORKSPACE_V2, tool_version="0.0.1")
+    after = policy.snapshot_tree(src)
+
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "non-finite" in exc.value.message
+    assert not out.exists()
+    assert policy.diff_snapshots(before, after) == []
+
+
 def test_migrate_native_results_lowers_preview_metadata(
     lowerable_native_results_dir: Path, tmp_path: Path
 ) -> None:

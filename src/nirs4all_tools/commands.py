@@ -12,6 +12,7 @@ stay here rather than in the runtime.
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import sqlite3
@@ -582,6 +583,25 @@ def _runtime_array_record_checksum(record: dict[str, Any]) -> str:
     return sha256_bytes(payload.encode("utf-8"))
 
 
+#: Runtime array-record fields whose numeric contents must be finite. The
+#: canonical checksum (:func:`_runtime_array_record_checksum`) and the runtime
+#: sidecar contract both serialize with ``allow_nan=False``, so a NaN/Infinity
+#: here is unrepresentable rather than an internal error.
+_RUNTIME_ARRAY_NUMERIC_FIELDS = ("val_score", "y_true", "y_pred", "y_proba", "weights")
+
+
+def _nonfinite_runtime_array_field(record: dict[str, Any]) -> str | None:
+    """Return the first field holding a non-finite (NaN/Infinity) number, if any."""
+    for field in _RUNTIME_ARRAY_NUMERIC_FIELDS:
+        value = record.get(field)
+        if value is None:
+            continue
+        for item in value if isinstance(value, list) else (value,):
+            if isinstance(item, float) and not math.isfinite(item):
+                return field
+    return None
+
+
 def _write_runtime_array_records(
     output: Path,
     records: list[dict[str, Any]],
@@ -599,6 +619,14 @@ def _write_runtime_array_records(
                 "runtime array sidecar record is missing field(s): " + ", ".join(missing),
                 cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
                 mitigation="preserve the source opaque, or update nirs4all-tools for this array shape",
+            )
+        nonfinite = _nonfinite_runtime_array_field(record)
+        if nonfinite is not None:
+            raise UnsupportedInput(
+                f"runtime array sidecar record {str(record.get('prediction_id'))!r} field {nonfinite!r} "
+                "contains a non-finite value (NaN/Infinity) that workspace-v2 sidecars cannot represent",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="use --copy-only to preserve this source verbatim, or repair the non-finite array value",
             )
 
     grouped: dict[str, list[dict[str, Any]]] = {}
