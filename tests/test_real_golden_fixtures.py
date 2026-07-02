@@ -762,3 +762,56 @@ def test_golden_sqlite_legacy_arrays_lowers_metadata_and_preserves_rows(tmp_path
     assert svm_rows[0]["y_proba_shape"] == [4, 2]
     assert svm_rows[0]["y_proba"] == [0.9, 0.1, 0.2, 0.8, 0.6, 0.4, 0.8, 0.2]
     assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
+
+
+def test_golden_sqlite_legacy_arrays_semantic_checksums_are_deterministic(tmp_path: Path) -> None:
+    """Lowered array-row and preserved-payload checksums are stable across independent runs.
+
+    Two migrations of byte-identical legacy sources must agree on every semantic checksum
+    surface -- the ``arrays:<prediction_id>`` row digests, the runtime array sidecar files, and
+    the preserved legacy-arrays JSONL -- proving the release artifact does not depend on
+    wall-clock time or run order. Only ``store.sqlite`` is excluded, because its ``created_at``
+    columns are intentionally time-based and therefore not byte-reproducible.
+    """
+    pytest.importorskip("pyarrow.parquet")
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    source_a = _materialize_sqlite_fixture("sqlite_legacy_arrays_workspace.sql", first_dir)
+    source_b = _materialize_sqlite_fixture("sqlite_legacy_arrays_workspace.sql", second_dir)
+    out_a = tmp_path / "out-a"
+    out_b = tmp_path / "out-b"
+
+    for source, out in ((source_a, out_a), (source_b, out_b)):
+        assert (
+            commands.migrate(
+                source,
+                output=out,
+                target=vocab.TARGET_WORKSPACE_V2,
+                strict=True,
+                verify=True,
+                tool_version="0.0.1",
+            )
+            == ExitCode.SUCCESS
+        )
+
+    manifest_a = _read_json(out_a / "migration-manifest.json")
+    manifest_b = _read_json(out_b / "migration-manifest.json")
+
+    def semantic(manifest: dict[str, object]) -> dict[str, object]:
+        checksums = manifest["checksums"]
+        assert isinstance(checksums, dict)
+        return {key: value for key, value in checksums.items() if key != "store.sqlite"}
+
+    assert semantic(manifest_a) == semantic(manifest_b)
+    assert set(semantic(manifest_a)) >= {
+        "arrays:pred-old-pls-val",
+        "arrays:pred-old-svm-test",
+        "arrays/corn-lot-2024.parquet",
+        "arrays/field_block_7.parquet",
+        "preserved/legacy-prediction-arrays.jsonl",
+    }
+    assert (out_a / "preserved" / "legacy-prediction-arrays.jsonl").read_bytes() == (
+        out_b / "preserved" / "legacy-prediction-arrays.jsonl"
+    ).read_bytes()

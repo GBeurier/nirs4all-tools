@@ -88,3 +88,34 @@ def test_native_results_preview_refuses_multidimensional_y_true_or_y_pred_shape(
     assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
     assert field in exc.value.message
     assert "workspace-v2 sidecars preserve only flat" in exc.value.message
+
+
+def test_native_results_proba_arrays_lower_to_flat_sidecar_record() -> None:
+    """A classification row's probability arrays and shape pass through to the sidecar record.
+
+    Unlike the legacy ``prediction_arrays`` path (which derives ``y_proba_shape`` from the
+    nested cell), native-results lowering takes ``y_proba`` as an already-flat projection and
+    carries ``y_proba_shape`` verbatim from the parquet row. Row-level ``metric``/``task_type``
+    also take precedence over the manifest defaults. This locks the multi-class proba surface,
+    which the existing empty-array test does not exercise.
+    """
+    record = runtime_array_records_from_native_results(
+        _preview(
+            _row(
+                model_name="SVC",
+                metric="accuracy",
+                task_type="classification",
+                y_true=[0.0, 1.0, 1.0, 0.0],
+                y_pred=[0.0, 1.0, 0.0, 0.0],
+                y_proba=[0.9, 0.1, 0.2, 0.8, 0.6, 0.4, 0.8, 0.2],
+                y_proba_shape=[4, 2],
+            )
+        )
+    )[0]
+
+    assert record["y_proba"] == [0.9, 0.1, 0.2, 0.8, 0.6, 0.4, 0.8, 0.2]
+    assert record["y_proba_shape"] == [4, 2]
+    assert record["y_true"] == [0.0, 1.0, 1.0, 0.0]
+    assert record["metric"] == "accuracy"
+    assert record["task_type"] == "classification"
+    assert record["model_name"] == "SVC"

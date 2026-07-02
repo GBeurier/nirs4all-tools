@@ -697,6 +697,49 @@ def test_migrate_native_results_lowers_preview_metadata(
     }
 
 
+def test_migrate_native_results_lowered_preserved_payload_is_byte_identical_and_verified(
+    lowerable_native_results_dir: Path, tmp_path: Path
+) -> None:
+    """Native-results lowering keeps the original payload byte-for-byte and verify guards it.
+
+    The lowered path copies the source ``native-results-v1`` directory under ``preserved/`` as
+    provenance and records a file-level checksum for every file. Verification must therefore
+    detect any post-migration tampering of that preserved payload, even though it is tracked via
+    ``checksums`` rather than the ``preserved_opaque`` ledger (which stays empty in the fully
+    lowered case). This locks the RC guarantee that the native payload survives conversion intact.
+    """
+    out = tmp_path / "out"
+    code = commands.migrate(
+        lowerable_native_results_dir,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        strict=True,
+        verify=True,
+        tool_version="0.0.1",
+    )
+    assert code == ExitCode.SUCCESS
+
+    preserved_root = out / "preserved" / "native-results-v1" / lowerable_native_results_dir.name
+    for name in ("manifest.json", "score_set.json", "predictions.parquet"):
+        assert (preserved_root / name).read_bytes() == (lowerable_native_results_dir / name).read_bytes()
+
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    preserved_rel = f"preserved/native-results-v1/{lowerable_native_results_dir.name}/predictions.parquet"
+    assert preserved_rel in manifest["checksums"]
+    assert manifest["preserved_opaque"] == []
+    assert commands.verify(out, manifest_path=manifest_path) == ExitCode.SUCCESS
+
+    # Tampering the preserved provenance payload must fail verification with the exact path.
+    (preserved_root / "predictions.parquet").write_bytes(b"tampered native payload")
+    report_path = tmp_path / "verify-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=report_path)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["verification_summary"]["checks"]["mismatched_files"] == [preserved_rel]
+
+
 def test_migrate_native_results_strict_refuses_without_output(
     native_results_dir: Path, tmp_path: Path
 ) -> None:
