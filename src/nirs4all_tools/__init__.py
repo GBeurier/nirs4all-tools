@@ -11,6 +11,6 @@ here, under a declared support window. See ``docs`` and the ecosystem report
 ``SW4_MIG_CONVERTER_spec.md`` for the signed ``LOCK-MIG`` contract.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 __all__ = ["__version__"]
