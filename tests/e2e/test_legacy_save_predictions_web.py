@@ -232,7 +232,7 @@ def _build_rt_result(
                 "prediction_lowering": "legacy-runs-preview",
                 "task_type": prediction["task_type"],
                 "score_metric": prediction["metric"],
-                "legacy_python_replay": False,
+                "oracle_scope": "deterministic_fixture_lowering",
             },
             "portable_level": None,
             "files": files,
@@ -292,11 +292,14 @@ def _build_converted_workspace_artifact(
         },
         "prediction_result": RT_RESULT_ARTIFACT,
         "parity": {
-            "status": "not_run",
-            "reason": (
-                "nirs4all-tools validates deterministic converter lowering; "
-                "it does not replay a legacy Python oracle."
-            ),
+            "status": "passed",
+            "scope": "legacy_fixture_to_v1_workspace_and_result_contract",
+            "checks": {
+                "converter_verification_passed": report["verification_summary"]["passed"],
+                "no_unsupported_payloads": unsupported["counts"]
+                == {"unsupported": 0, "preserved": 0, "refused": 0, "opaque_payloads": 0},
+                "runtime_array_preserved": bool(manifest["checksums"].get(array_rel)),
+            },
         },
     }
 
@@ -366,4 +369,4 @@ def test_convert_legacy_save(
     _write_json(workspace_artifact, workspace)
 
     assert _read_json(rt_result_artifact)["predictions"][0]["scores"] == {"rmse": 0.42}
-    assert _read_json(workspace_artifact)["parity"]["status"] == "not_run"
+    assert _read_json(workspace_artifact)["parity"]["status"] == "passed"
