@@ -15,6 +15,28 @@ from pathlib import Path
 import pytest
 
 
+def pytest_addoption(parser) -> None:
+    parser.addoption(
+        "--artifacts-dir",
+        action="store",
+        default=None,
+        help="Directory where ecosystem e2e tests write machine-readable artifacts.",
+    )
+
+
+@pytest.fixture
+def artifacts_dir(request: pytest.FixtureRequest, tmp_path: Path) -> Path:
+    raw = request.config.getoption("--artifacts-dir")
+    path = Path(raw).expanduser() if raw else tmp_path / "artifacts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@pytest.fixture
+def artifacts_dir_explicit(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--artifacts-dir") is not None
+
+
 def make_sqlite_workspace(root: Path, *, user_version: int = 2, legacy_arrays: bool = False) -> Path:
     """Create a minimal ``store.sqlite`` workspace directory."""
     root.mkdir(parents=True, exist_ok=True)
