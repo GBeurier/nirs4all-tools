@@ -16,6 +16,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.package_version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -24,6 +26,58 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
+
+      - name: Read package version
+        id: package_version
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          from pathlib import Path
+
+          text = Path("src/nirs4all_tools/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'^__version__ = "([^"]+)"$', text, re.MULTILINE)
+          if not match:
+              raise SystemExit("Could not find __version__ in src/nirs4all_tools/__init__.py")
+          print(f"version={match.group(1)}")
+          PY
+
+      - name: Verify publish ref matches package version
+        if: github.event_name == 'release' || inputs.dry_run == 'false'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PACKAGE_VERSION: ${{ steps.package_version.outputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          python - <<'PY'
+          import os
+
+          package_version = os.environ["PACKAGE_VERSION"]
+          expected_tag = f"v{package_version}"
+          event_name = os.environ["EVENT_NAME"]
+
+          if event_name == "release":
+              actual_tag = os.environ["RELEASE_TAG"]
+              if actual_tag != expected_tag:
+                  raise SystemExit(
+                      f"Release tag {actual_tag!r} does not match package version {package_version!r} "
+                      f"(expected {expected_tag!r})."
+                  )
+          else:
+              ref_type = os.environ["REF_TYPE"]
+              ref_name = os.environ["REF_NAME"]
+              if ref_type != "tag":
+                  raise SystemExit(
+                      "Manual publish requires running workflow_dispatch from a tag ref; "
+                      f"got ref_type={ref_type!r}, ref_name={ref_name!r}."
+                  )
+              if ref_name != expected_tag:
+                  raise SystemExit(
+                      f"Manual publish tag {ref_name!r} does not match package version {package_version!r} "
+                      f"(expected {expected_tag!r})."
+                  )
+          PY
 
       - name: Build sdist + wheel
         run: |

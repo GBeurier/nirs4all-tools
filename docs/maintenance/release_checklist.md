@@ -13,11 +13,13 @@ Publishing is via `publish.yml` (release / dispatch). Branch pushes never publis
 ## Pre-release
 
 - [ ] Green gate + CI green (see `quality_gates.md`).
-- [ ] `CHANGELOG.md` `[0.0.1]` dated; version single-sourced in `nirs4all_tools.__version__`.
+- [ ] `CHANGELOG.md` has a dated `[X.Y.Z]` entry for the exact `nirs4all_tools.__version__`.
 - [ ] PyPI Trusted Publisher configured (a prior `Publish to PyPI [release]` run failed — verify the
       trusted-publisher / environment setup before the next tag).
 
 ## Release
 
-- [ ] Tag `vX.Y.Z` on the exact release commit; publish the GitHub Release (triggers `publish.yml`).
+- [ ] Tag `vX.Y.Z` on the exact release commit; `publish.yml` now rejects release/manual publish runs whose
+      Git ref does not match `nirs4all_tools.__version__`.
+- [ ] Publish the GitHub Release from that exact tag (triggers `publish.yml`).
 - [ ] `pip install "nirs4all-tools[parquet]==X.Y.Z"` in a clean venv; smoke `nirs4all-tools --help`.
