@@ -498,6 +498,35 @@ def _flatten_array(value: Any, *, field: str, prediction_id: str, dtype: type[fl
     return flattened
 
 
+def _assert_runtime_array_row_lengths(
+    prediction_id: str,
+    *,
+    sample_indices: list[Any] | None,
+    y_true: list[Any] | None,
+    y_pred: list[Any] | None,
+    weights: list[Any] | None,
+) -> None:
+    """Refuse a legacy array row whose per-sample columns disagree on length.
+
+    Mirrors the loose-predictions contract
+    (:func:`nirs4all_tools.loose_predictions._validate_prediction_record`): ``sample_indices``,
+    ``y_true``, ``y_pred``, and ``weights`` all describe the same samples and must therefore share
+    a single length. Without this check a corrupt legacy row (e.g. ``y_true`` with 3 values but
+    ``y_pred`` with 2) would lower into a runtime sidecar that silently misaligns ``y_true[i]``
+    with ``y_pred[i]`` yet still passes checksum verification. ``y_proba`` is excluded because it
+    legitimately carries a per-class second dimension (``[n_samples, n_classes]``) recorded
+    separately in ``y_proba_shape``.
+    """
+    lengths = {len(values) for values in (sample_indices, y_true, y_pred, weights) if values is not None}
+    if len(lengths) > 1:
+        raise UnsupportedInput(
+            f"legacy prediction_arrays row {prediction_id!r} has mismatched per-sample array lengths "
+            f"across sample_indices/y_true/y_pred/weights ({sorted(lengths)})",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="use --copy-only to preserve this source verbatim, or repair the array lengths",
+        )
+
+
 def _normalise_runtime_array_record(row: dict[str, Any]) -> dict[str, Any]:
     """Convert one legacy row into the runtime array-sidecar record shape."""
     prediction_id = str(row.get("prediction_id") or "")
@@ -514,6 +543,18 @@ def _normalise_runtime_array_record(row: dict[str, Any]) -> dict[str, Any]:
     sample_indices = _decode_json_array(row.get("sample_indices"), field="sample_indices", prediction_id=prediction_id)
     weights = _decode_json_array(row.get("weights"), field="weights", prediction_id=prediction_id)
 
+    flat_y_true = _flatten_array(y_true, field="y_true", prediction_id=prediction_id, dtype=float)
+    flat_y_pred = _flatten_array(y_pred, field="y_pred", prediction_id=prediction_id, dtype=float)
+    flat_sample_indices = _flatten_array(sample_indices, field="sample_indices", prediction_id=prediction_id, dtype=int)
+    flat_weights = _flatten_array(weights, field="weights", prediction_id=prediction_id, dtype=float)
+    _assert_runtime_array_row_lengths(
+        prediction_id,
+        sample_indices=flat_sample_indices,
+        y_true=flat_y_true,
+        y_pred=flat_y_pred,
+        weights=flat_weights,
+    )
+
     return {
         "prediction_id": prediction_id,
         "dataset_name": str(row.get("dataset_name") or "unknown"),
@@ -523,17 +564,12 @@ def _normalise_runtime_array_record(row: dict[str, Any]) -> dict[str, Any]:
         "metric": str(row.get("metric") or ""),
         "val_score": row.get("val_score"),
         "task_type": str(row.get("task_type") or ""),
-        "y_true": _flatten_array(y_true, field="y_true", prediction_id=prediction_id, dtype=float),
-        "y_pred": _flatten_array(y_pred, field="y_pred", prediction_id=prediction_id, dtype=float),
+        "y_true": flat_y_true,
+        "y_pred": flat_y_pred,
         "y_proba": _flatten_array(y_proba, field="y_proba", prediction_id=prediction_id, dtype=float),
         "y_proba_shape": _array_shape(y_proba),
-        "sample_indices": _flatten_array(
-            sample_indices,
-            field="sample_indices",
-            prediction_id=prediction_id,
-            dtype=int,
-        ),
-        "weights": _flatten_array(weights, field="weights", prediction_id=prediction_id, dtype=float),
+        "sample_indices": flat_sample_indices,
+        "weights": flat_weights,
         "sample_metadata": None,
     }
 
@@ -1400,24 +1436,34 @@ def _run_sqlite_legacy_arrays_transform(
             if legacy_rows:
                 try:
                     runtime_array_checksums, runtime_array_inventory = _write_runtime_legacy_arrays(output, legacy_rows)
-                except UnsupportedInput:
+                except UnsupportedInput as exc:
                     if strict:
                         raise
+                    # The array lowering can fail either because the optional pyarrow writer is
+                    # absent (capability) or because a legacy row is itself unlowerable — malformed
+                    # JSON, non-numeric cells, or mismatched per-sample lengths (shape). Record the
+                    # true cause so the manifest/report do not misattribute a corrupt row to a
+                    # missing dependency.
+                    if exc.cause == vocab.CAUSE_UNSUPPORTED_CAPABILITY:
+                        warning = (
+                            "legacy prediction_arrays preserved as opaque JSONL; "
+                            "install the parquet extra for semantic lowering"
+                        )
+                    else:
+                        warning = (
+                            "legacy prediction_arrays preserved as opaque JSONL because a row could not "
+                            f"be lowered: {exc.message}"
+                        )
                     manifest["unsupported"].append(
                         {
                             "item": "prediction_arrays",
-                            "reason": "runtime Parquet array lowering unavailable in this environment",
+                            "reason": exc.message,
+                            "cause": exc.cause,
                             "disposition": "preserved",
                         }
                     )
-                    manifest["warnings"].append(
-                        "legacy prediction_arrays preserved as opaque JSONL; "
-                        "install the parquet extra for semantic lowering"
-                    )
-                    report["warnings"].append(
-                        "legacy prediction_arrays preserved as opaque JSONL; "
-                        "install the parquet extra for semantic lowering"
-                    )
+                    manifest["warnings"].append(warning)
+                    report["warnings"].append(warning)
                     report["unsupported_counts"]["preserved"] = len(legacy_rows)
                 else:
                     arrays_lowered = True

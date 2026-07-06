@@ -428,6 +428,110 @@ def test_migrate_sqlite_legacy_arrays_strict_lowers_without_warnings(
     assert report["warnings"] == []
 
 
+def _make_legacy_arrays_length_mismatch_workspace(root: Path) -> Path:
+    """A legacy-arrays workspace whose single row has mismatched y_true/y_pred lengths.
+
+    ``y_true`` carries three samples while ``y_pred`` carries two, so lowering the row into a
+    runtime sidecar would silently misalign ``y_true[i]`` with ``y_pred[i]``.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(root / "store.sqlite")
+    try:
+        con.executescript(
+            """
+            CREATE TABLE runs (run_id TEXT PRIMARY KEY, name TEXT NOT NULL, config TEXT,
+                               datasets TEXT, status TEXT);
+            CREATE TABLE pipelines (pipeline_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, name TEXT NOT NULL,
+                                    expanded_config TEXT, generator_choices TEXT, dataset_name TEXT NOT NULL);
+            CREATE TABLE chains (chain_id TEXT PRIMARY KEY, pipeline_id TEXT NOT NULL, steps TEXT NOT NULL,
+                                 model_step_idx INTEGER NOT NULL, model_class TEXT NOT NULL, preprocessings TEXT);
+            CREATE TABLE predictions (prediction_id TEXT PRIMARY KEY, pipeline_id TEXT NOT NULL, chain_id TEXT,
+                                      dataset_name TEXT NOT NULL, model_name TEXT NOT NULL, model_class TEXT NOT NULL,
+                                      fold_id TEXT NOT NULL, partition TEXT NOT NULL, metric TEXT NOT NULL,
+                                      task_type TEXT NOT NULL);
+            CREATE TABLE prediction_arrays (prediction_id TEXT PRIMARY KEY, y_true TEXT, y_pred TEXT,
+                                            y_proba TEXT, sample_indices TEXT, weights TEXT);
+            """
+        )
+        con.execute("INSERT INTO runs VALUES ('run-1', 'legacy run', '{}', '[]', 'completed')")
+        con.execute("INSERT INTO pipelines VALUES ('pipe-1', 'run-1', 'pipe', '{}', '[]', 'dataset-a')")
+        con.execute("INSERT INTO chains VALUES ('chain-1', 'pipe-1', '[]', 0, 'PLSRegression', 'SNV')")
+        con.execute(
+            "INSERT INTO predictions VALUES ('pred-1', 'pipe-1', 'chain-1', 'dataset-a', 'PLSRegression', "
+            "'sklearn.cross_decomposition.PLSRegression', 'fold-0', 'val', 'rmse', 'regression')"
+        )
+        con.execute(
+            "INSERT INTO prediction_arrays VALUES ('pred-1', ?, ?, NULL, ?, NULL)",
+            [json.dumps([1.0, 2.0, 3.0]), json.dumps([1.1, 1.9]), json.dumps([0, 1, 2])],
+        )
+        con.execute("PRAGMA user_version = 2")
+        con.commit()
+    finally:
+        con.close()
+    return root
+
+
+def test_migrate_sqlite_legacy_arrays_strict_refuses_length_mismatch(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    source = _make_legacy_arrays_length_mismatch_workspace(tmp_path / "ws")
+    out = tmp_path / "out"
+
+    def run() -> None:
+        with pytest.raises(UnsupportedInput) as exc:
+            commands.migrate(
+                source,
+                output=out,
+                target=vocab.TARGET_WORKSPACE_V2,
+                strict=True,
+                tool_version="0.0.1",
+            )
+        assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+        assert "mismatched per-sample array lengths" in exc.value.message
+        assert "'pred-1'" in exc.value.message
+
+    _unchanged(source, run)
+    assert not out.exists()
+
+
+def test_migrate_sqlite_legacy_arrays_best_effort_preserves_length_mismatch(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    source = _make_legacy_arrays_length_mismatch_workspace(tmp_path / "ws")
+    out = tmp_path / "out"
+
+    def run() -> None:
+        code = commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.MIGRATED_WITH_WARNINGS
+
+    _unchanged(source, run)
+
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((out / "migration-report.json").read_text(encoding="utf-8"))
+
+    # The corrupt row is never lowered into a runtime array sidecar ...
+    assert not (out / "arrays").exists()
+    assert report["migrated_counts"]["arrays"] == 0
+    # ... but the raw legacy rows are still preserved verbatim as checksummed audit JSONL,
+    # and the store metadata (run/pipeline/chain/prediction) still lowers.
+    preserved = out / "preserved" / "legacy-prediction-arrays.jsonl"
+    assert preserved.exists()
+    assert "preserved/legacy-prediction-arrays.jsonl" in manifest["checksums"]
+    assert report["migrated_counts"]["predictions"] == 1
+
+    # The unsupported ledger records the true shape cause, not a spurious missing-pyarrow reason.
+    prediction_arrays_items = [item for item in manifest["unsupported"] if item["item"] == "prediction_arrays"]
+    assert len(prediction_arrays_items) == 1
+    assert prediction_arrays_items[0]["cause"] == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "mismatched per-sample array lengths" in prediction_arrays_items[0]["reason"]
+    assert not any("install the parquet extra" in warning for warning in report["warnings"])
+    assert report["verification_summary"]["passed"] is True
+
+
 def test_migrate_native_results_preserves_opaque_best_effort(
     native_results_dir: Path, tmp_path: Path
 ) -> None:
