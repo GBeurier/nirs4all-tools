@@ -4,6 +4,14 @@ All notable changes to **nirs4all-tools** are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.4] — 2026-07-07
+
+Patch release for the V1 RC publication lane.
+
+### Fixed
+- Validate the PyPI Trusted Publisher tuple before upload.
+- Keep citation metadata aligned with the package version for release health checks.
+
 ## [0.0.3] — 2026-07-07
 
 Patch release for the V1 RC migration lane.

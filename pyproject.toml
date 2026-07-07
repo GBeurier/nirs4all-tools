@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,13 +14,13 @@ maintainers = [
     { name = "Gregory Beurier", email = "gregory.beurier@cirad.fr" },
 ]
 readme = "README.md"
-license = { text = "CeCILL-2.1 OR AGPL-3.0-or-later" }
+license = "CECILL-2.1 OR AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 keywords = ["nirs4all", "migration", "workspace", "legacy", "converter"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
