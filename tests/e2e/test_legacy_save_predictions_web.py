@@ -20,6 +20,7 @@ import pytest
 SCENARIO_ID = "e2e-converter-legacy-save-predictions-web"
 WORKSPACE_ARTIFACT = "converted-workspace.n4a.json"
 RT_RESULT_ARTIFACT = "predictions.rt_result.json"
+PIPELINE_OPEN_ARTIFACT = "python-open-pipeline.json"
 PIPELINE_RERUN_ARTIFACT = "python-rerun-pipeline.json"
 CONVERTED_WORKSPACE_DIR = "converted-workspace-v2"
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "legacy" / "old_workspace_mixed"
@@ -348,6 +349,168 @@ def _build_converted_workspace_artifact(
     }
 
 
+def _build_python_open_pipeline_artifact(
+    *,
+    artifacts_dir: Path,
+    output: Path,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    array_rel: str,
+    array_row: dict[str, Any],
+) -> dict[str, Any]:
+    from nirs4all_tools import contracts
+    from nirs4all_tools.checksums import sha256_file
+
+    workspace_artifact = artifacts_dir / WORKSPACE_ARTIFACT
+    rt_result_artifact = artifacts_dir / RT_RESULT_ARTIFACT
+    reopened_workspace = _read_json(workspace_artifact)
+    reopened_rt_result = _read_json(rt_result_artifact)
+    reopened_manifest = _read_json(output / "migration-manifest.json")
+    reopened_report = _read_json(output / "migration-report.json")
+
+    store = output / "store.sqlite"
+    store_sha256 = sha256_file(store)
+    array_sha256 = sha256_file(output / array_rel)
+    workspace_row_counts = reopened_workspace["workspace"]["row_counts"]
+    rt_report = reopened_rt_result["reports"][0]
+    rt_prediction = reopened_rt_result["predictions"][0]
+    rt_prediction_rows = len(rt_prediction["sample_indices"])
+
+    with sqlite3.connect(f"file:{store.resolve().as_posix()}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        user_version_row = conn.execute("PRAGMA user_version").fetchone()
+        store_user_version = int(user_version_row[0]) if user_version_row else None
+        integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
+        integrity_ok = bool(integrity_row and integrity_row[0] == "ok")
+        foreign_key_failures = [dict(row) for row in conn.execute("PRAGMA foreign_key_check")]
+        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        required_tables = {"runs", "pipelines", "chains", "predictions"}
+        row_counts = {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in sorted(required_tables)
+        }
+
+        def one(sql: str) -> dict[str, Any]:
+            row = conn.execute(sql).fetchone()
+            assert row is not None
+            return dict(row)
+
+        run_row = one("SELECT run_id, datasets, status FROM runs ORDER BY run_id")
+        pipeline_row = one(
+            """
+            SELECT pipeline_id, run_id, name, expanded_config, generator_choices, dataset_name, status, metric
+            FROM pipelines
+            ORDER BY pipeline_id
+            """
+        )
+        chain_row = one(
+            """
+            SELECT chain_id, pipeline_id, steps, model_class, model_name, metric, task_type, dataset_name
+            FROM chains
+            ORDER BY chain_id
+            """
+        )
+        prediction_row = one(
+            """
+            SELECT prediction_id, pipeline_id, chain_id, dataset_name, model_name, model_class,
+                   fold_id, partition, metric, task_type, n_samples, prediction_scope, prediction_level
+            FROM predictions
+            ORDER BY prediction_id
+            """
+        )
+
+    pipeline_config = json.loads(str(pipeline_row["expanded_config"] or "{}"))
+    pipeline_generator_choices = json.loads(str(pipeline_row["generator_choices"] or "[]"))
+    chain_steps = json.loads(str(chain_row["steps"] or "[]"))
+    run_datasets = json.loads(str(run_row["datasets"] or "[]"))
+    expected_store_counts = {
+        "runs": int(report["migrated_counts"]["runs"]),
+        "pipelines": int(report["migrated_counts"]["pipelines"]),
+        "chains": int(report["migrated_counts"]["chains"]),
+        "predictions": int(report["migrated_counts"]["predictions"]),
+    }
+    workspace_counts_match = all(int(workspace_row_counts[key]) == row_counts[key] for key in expected_store_counts)
+    row_counts_match_report = row_counts == expected_store_counts
+
+    return {
+        "schema_version": "n4a.e2e.python_open_pipeline.v1",
+        "scenario_id": SCENARIO_ID,
+        "status": "passed",
+        "legacy_workspace_opened": True,
+        "converted_workspace_reopened": True,
+        "store_reopened_read_only": True,
+        "sqlite_integrity_ok": integrity_ok,
+        "sqlite_foreign_key_check_ok": foreign_key_failures == [],
+        "required_tables_present": required_tables <= tables,
+        "runtime_result_reopened": True,
+        "pipeline_metadata_reopened": bool(pipeline_row["pipeline_id"] and chain_steps),
+        "chain_metadata_reopened": bool(chain_row["chain_id"] and chain_row["model_class"]),
+        "prediction_metadata_reopened": bool(prediction_row["prediction_id"]),
+        "store_hash_match": store_sha256 == manifest["checksums"]["store.sqlite"],
+        "array_hash_match": array_sha256 == manifest["checksums"][array_rel],
+        "manifest_source_fingerprint_match": reopened_manifest["source"]["fingerprint"]
+        == manifest["source"]["fingerprint"],
+        "report_verification_summary_match": reopened_report["verification_summary"] == report["verification_summary"],
+        "store_user_version": store_user_version,
+        "expected_store_user_version": contracts.WORKSPACE_V2_USER_VERSION,
+        "store_user_version_match": store_user_version == contracts.WORKSPACE_V2_USER_VERSION,
+        "row_counts_match_report": row_counts_match_report,
+        "workspace_artifact_counts_match_store": workspace_counts_match,
+        "run_pipeline_fk_match": pipeline_row["run_id"] == run_row["run_id"],
+        "chain_pipeline_fk_match": chain_row["pipeline_id"] == pipeline_row["pipeline_id"],
+        "prediction_pipeline_fk_match": prediction_row["pipeline_id"] == pipeline_row["pipeline_id"],
+        "prediction_chain_fk_match": prediction_row["chain_id"] == chain_row["chain_id"],
+        "pipeline_dataset_match": pipeline_row["dataset_name"] == prediction_row["dataset_name"],
+        "chain_dataset_match": chain_row["dataset_name"] == prediction_row["dataset_name"],
+        "chain_model_class_match": chain_row["model_class"] == prediction_row["model_class"],
+        "chain_model_name_match": chain_row["model_name"] == prediction_row["model_name"],
+        "runtime_result_pipeline_id_match": reopened_rt_result["plan_id"] == prediction_row["pipeline_id"],
+        "runtime_result_prediction_id_match": rt_report["prediction_id"] == prediction_row["prediction_id"],
+        "runtime_result_rows_match": rt_prediction_rows == int(prediction_row["n_samples"]),
+        "array_prediction_id_match": array_row["prediction_id"] == prediction_row["prediction_id"],
+        "array_rows_match": len(array_row["sample_indices"]) == int(prediction_row["n_samples"]),
+        "pipeline_step_count": len(chain_steps),
+        "pipeline_classes": [str(step) for step in chain_steps],
+        "prediction_rows": int(rt_prediction_rows),
+        "workspace_row_counts": {
+            "runs": int(workspace_row_counts["runs"]),
+            "pipelines": int(workspace_row_counts["pipelines"]),
+            "chains": int(workspace_row_counts["chains"]),
+            "predictions": int(workspace_row_counts["predictions"]),
+            "arrays": int(workspace_row_counts["arrays"]),
+        },
+        "store_row_counts": row_counts,
+        "artifacts": {
+            "converted_workspace": WORKSPACE_ARTIFACT,
+            "runtime_result": RT_RESULT_ARTIFACT,
+            "store": _relative(artifacts_dir, output / "store.sqlite"),
+            "runtime_array": _relative(artifacts_dir, output / array_rel),
+        },
+        "fingerprints": {
+            "store_sha256": store_sha256,
+            "runtime_array_sha256": array_sha256,
+            "source_fingerprint": manifest["source"]["fingerprint"],
+        },
+        "converted": {
+            "run_id": run_row["run_id"],
+            "pipeline_id": pipeline_row["pipeline_id"],
+            "chain_id": chain_row["chain_id"],
+            "prediction_id": prediction_row["prediction_id"],
+            "dataset_name": prediction_row["dataset_name"],
+            "model_name": prediction_row["model_name"],
+            "model_class": prediction_row["model_class"],
+            "metric": prediction_row["metric"],
+            "task_type": prediction_row["task_type"],
+            "prediction_scope": prediction_row["prediction_scope"],
+            "prediction_level": prediction_row["prediction_level"],
+            "run_datasets": run_datasets,
+            "pipeline_config": pipeline_config,
+            "pipeline_generator_choices": pipeline_generator_choices,
+        },
+    }
+
+
 def _assert_rt_result_shape(rt_result: dict[str, Any]) -> None:
     assert set(rt_result) == RT_RESULT_REQUIRED_KEYS | RT_RESULT_OPTIONAL_KEYS
     assert set(rt_result["manifest"]) == RT_MANIFEST_KEYS
@@ -483,12 +646,59 @@ def test_python_rerun_converted_pipeline(
         artifacts_dir_explicit=artifacts_dir_explicit,
         tmp_path=tmp_path,
     )
+    open_evidence = _build_python_open_pipeline_artifact(
+        artifacts_dir=artifacts_dir,
+        output=state["output"],
+        manifest=state["manifest"],
+        report=state["report"],
+        array_rel=state["array_rel"],
+        array_row=state["array_row"],
+    )
+    for check_name in (
+        "legacy_workspace_opened",
+        "converted_workspace_reopened",
+        "store_reopened_read_only",
+        "sqlite_integrity_ok",
+        "sqlite_foreign_key_check_ok",
+        "required_tables_present",
+        "runtime_result_reopened",
+        "pipeline_metadata_reopened",
+        "chain_metadata_reopened",
+        "prediction_metadata_reopened",
+        "store_hash_match",
+        "array_hash_match",
+        "manifest_source_fingerprint_match",
+        "report_verification_summary_match",
+        "store_user_version_match",
+        "row_counts_match_report",
+        "workspace_artifact_counts_match_store",
+        "run_pipeline_fk_match",
+        "chain_pipeline_fk_match",
+        "prediction_pipeline_fk_match",
+        "prediction_chain_fk_match",
+        "pipeline_dataset_match",
+        "chain_dataset_match",
+        "chain_model_class_match",
+        "chain_model_name_match",
+        "runtime_result_pipeline_id_match",
+        "runtime_result_prediction_id_match",
+        "runtime_result_rows_match",
+        "array_prediction_id_match",
+        "array_rows_match",
+    ):
+        assert open_evidence[check_name] is True
+    assert open_evidence["store_user_version"] == open_evidence["expected_store_user_version"]
+    assert open_evidence["prediction_rows"] > 0
+    assert open_evidence["pipeline_step_count"] > 0
+    _write_json(artifacts_dir / PIPELINE_OPEN_ARTIFACT, open_evidence)
+
     prediction = state["prediction"]
     array_row = state["array_row"]
     fixture = _read_json(RERUNNABLE_PIPELINE_FIXTURE)
     assert fixture["scenario_id"] == SCENARIO_ID
     assert fixture["dataset"]["id"] == prediction["dataset_name"]
     assert fixture["comparison"]["prediction_id"] == prediction["prediction_id"]
+    assert _read_json(artifacts_dir / PIPELINE_OPEN_ARTIFACT)["status"] == "passed"
 
     pipeline = _pipeline_from_fixture(fixture, prediction, refs)
     x = np.asarray(fixture["dataset"]["x"], dtype=float)
