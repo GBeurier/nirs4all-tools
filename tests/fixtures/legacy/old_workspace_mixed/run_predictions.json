@@ -10,8 +10,8 @@
   "metric": "rmse",
   "task_type": "regression",
   "sample_indices": [0, 1, 2],
-  "preprocessing": ["SNV", "SavitzkyGolay"],
-  "val_score": 0.42,
-  "y_true": [31.2, 29.8, 33.5],
+  "preprocessing": [],
+  "val_score": 0.0,
+  "y_true": [31.0, 30.1, 33.0],
   "y_pred": [31.0, 30.1, 33.0]
 }

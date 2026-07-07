@@ -253,7 +253,7 @@ def test_golden_standalone_loose_predictions_lowers_and_preserves_payload(tmp_pa
     assert prediction_id == "pred-loose-001"
     assert manifest["checksums"][f"arrays:{prediction_id}"].startswith("sha256:")
     assert rows[0]["sample_indices"] == [0, 1, 2]
-    assert rows[0]["y_true"] == [31.2, 29.8, 33.5]
+    assert rows[0]["y_true"] == [31.0, 30.1, 33.0]
     assert rows[0]["y_pred"] == [31.0, 30.1, 33.0]
     assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
 

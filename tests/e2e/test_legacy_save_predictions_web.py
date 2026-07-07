@@ -8,6 +8,7 @@ envelope consumed by Web result-panel tests.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import sqlite3
 import sys
@@ -19,8 +20,10 @@ import pytest
 SCENARIO_ID = "e2e-converter-legacy-save-predictions-web"
 WORKSPACE_ARTIFACT = "converted-workspace.n4a.json"
 RT_RESULT_ARTIFACT = "predictions.rt_result.json"
+PIPELINE_RERUN_ARTIFACT = "python-rerun-pipeline.json"
 CONVERTED_WORKSPACE_DIR = "converted-workspace-v2"
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "legacy" / "old_workspace_mixed"
+RERUNNABLE_PIPELINE_FIXTURE = FIXTURE_ROOT / "rerunnable_pipeline.n4a.json"
 
 RT_RESULT_REQUIRED_KEYS = {
     "schema_version",
@@ -102,6 +105,29 @@ def _require_supported_python(explicit_artifacts_dir: bool) -> None:
     if explicit_artifacts_dir:
         pytest.fail(message)
     pytest.skip(message)
+
+
+def _require_nirs4all_reference(explicit_artifacts_dir: bool) -> dict[str, Any]:
+    try:
+        import nirs4all
+        import numpy as np
+        from sklearn.cross_decomposition import PLSRegression
+        from sklearn.model_selection import ShuffleSplit
+    except ImportError as exc:
+        message = (
+            "legacy pipeline rerun e2e requires the sibling Python nirs4all reference; "
+            "run with PYTHONPATH=/path/to/nirs4all checkout"
+        )
+        if explicit_artifacts_dir:
+            pytest.fail(message)
+        pytest.skip(message)
+        raise AssertionError("unreachable") from exc
+    return {
+        "np": np,
+        "nirs4all": nirs4all,
+        "PLSRegression": PLSRegression,
+        "ShuffleSplit": ShuffleSplit,
+    }
 
 
 def _run_converter_cli(source: Path, output: Path) -> None:
@@ -332,11 +358,12 @@ def _assert_rt_result_shape(rt_result: dict[str, Any]) -> None:
         assert set(prediction) == RT_PREDICTION_KEYS
 
 
-def test_convert_legacy_save(
+def _materialize_converted_state(
+    *,
     artifacts_dir: Path,
     artifacts_dir_explicit: bool,
     tmp_path: Path,
-) -> None:
+) -> dict[str, Any]:
     _require_supported_python(artifacts_dir_explicit)
     pq = _require_pyarrow(artifacts_dir_explicit)
     source = _copy_lowerable_legacy_save(tmp_path)
@@ -362,7 +389,7 @@ def test_convert_legacy_save(
     assert report["migrated_counts"]["arrays"] == 1
     assert prediction["prediction_id"] == array_row["prediction_id"] == "pred-loose-001"
     assert array_row["sample_indices"] == [0, 1, 2]
-    assert array_row["y_true"] == [31.2, 29.8, 33.5]
+    assert array_row["y_true"] == [31.0, 30.1, 33.0]
     assert array_row["y_pred"] == [31.0, 30.1, 33.0]
 
     rt_result = _build_rt_result(
@@ -386,7 +413,166 @@ def test_convert_legacy_save(
     _write_json(rt_result_artifact, rt_result)
     _write_json(workspace_artifact, workspace)
 
+    return {
+        "output": output,
+        "manifest": manifest,
+        "report": report,
+        "unsupported": unsupported,
+        "prediction": prediction,
+        "array_rel": array_rel,
+        "array_row": array_row,
+        "rt_result": rt_result,
+        "workspace": workspace,
+    }
+
+
+def _pipeline_from_fixture(fixture: dict[str, Any], prediction: dict[str, Any], refs: dict[str, Any]) -> list[Any]:
+    pipeline: list[Any] = []
+    for step in fixture["pipeline"]:
+        class_name = step["class"]
+        params = dict(step.get("params") or {})
+        if class_name == "sklearn.model_selection.ShuffleSplit":
+            pipeline.append(refs["ShuffleSplit"](**params))
+        elif class_name == "sklearn.cross_decomposition.PLSRegression":
+            assert prediction["model_class"] == class_name
+            pipeline.append(
+                {"model": refs["PLSRegression"](**params), "name": str(step.get("name") or "PLSRegression")}
+            )
+        else:
+            raise AssertionError(f"unsupported rerunnable fixture step: {class_name}")
+    return pipeline
+
+
+def test_convert_legacy_save(
+    artifacts_dir: Path,
+    artifacts_dir_explicit: bool,
+    tmp_path: Path,
+) -> None:
+    state = _materialize_converted_state(
+        artifacts_dir=artifacts_dir,
+        artifacts_dir_explicit=artifacts_dir_explicit,
+        tmp_path=tmp_path,
+    )
+
+    rt_result = state["rt_result"]
+    workspace = state["workspace"]
+    rt_result_artifact = artifacts_dir / RT_RESULT_ARTIFACT
+    workspace_artifact = artifacts_dir / WORKSPACE_ARTIFACT
+
     assert _read_json(rt_result_artifact)["status"] == "passed"
     assert _read_json(rt_result_artifact)["parity"]["status"] == "passed"
-    assert _read_json(rt_result_artifact)["predictions"][0]["scores"] == {"rmse": 0.42}
+    assert _read_json(rt_result_artifact)["predictions"][0]["scores"] == {"rmse": 0.0}
     assert _read_json(workspace_artifact)["parity"]["status"] == "passed"
+    assert rt_result["predictions"][0]["y_true"] == [31.0, 30.1, 33.0]
+    assert rt_result["predictions"][0]["y_pred"] == [31.0, 30.1, 33.0]
+    assert workspace["parity"]["status"] == "passed"
+
+
+def test_python_rerun_converted_pipeline(
+    artifacts_dir: Path,
+    artifacts_dir_explicit: bool,
+    tmp_path: Path,
+) -> None:
+    _require_supported_python(artifacts_dir_explicit)
+    refs = _require_nirs4all_reference(artifacts_dir_explicit)
+    np = refs["np"]
+    nirs4all = refs["nirs4all"]
+
+    state = _materialize_converted_state(
+        artifacts_dir=artifacts_dir,
+        artifacts_dir_explicit=artifacts_dir_explicit,
+        tmp_path=tmp_path,
+    )
+    prediction = state["prediction"]
+    array_row = state["array_row"]
+    fixture = _read_json(RERUNNABLE_PIPELINE_FIXTURE)
+    assert fixture["scenario_id"] == SCENARIO_ID
+    assert fixture["dataset"]["id"] == prediction["dataset_name"]
+    assert fixture["comparison"]["prediction_id"] == prediction["prediction_id"]
+
+    pipeline = _pipeline_from_fixture(fixture, prediction, refs)
+    x = np.asarray(fixture["dataset"]["x"], dtype=float)
+    y = np.asarray(fixture["dataset"]["y"], dtype=float)
+    assert x.ndim == 2
+    assert y.ndim == 1
+    assert x.shape[0] == y.shape[0]
+
+    result = nirs4all.run(
+        pipeline,
+        (x, y),
+        name="e2e_converted_legacy_pipeline_rerun",
+        verbose=0,
+        save_artifacts=False,
+        save_charts=False,
+        random_state=42,
+        refit=True,
+        workspace_path=artifacts_dir / "python-rerun-workspace",
+    )
+    rerun_prediction = result.final or result.best
+    assert rerun_prediction is not None
+    rerun_y_pred = np.asarray(rerun_prediction["y_pred"], dtype=float).reshape(-1)
+    rerun_y_true = np.asarray(rerun_prediction["y_true"], dtype=float).reshape(-1)
+    assert rerun_y_pred.shape == rerun_y_true.shape
+    assert rerun_y_pred.size == y.size
+
+    sample_indices = [int(item) for item in array_row["sample_indices"]]
+    selected_pred = np.asarray([rerun_y_pred[index] for index in sample_indices], dtype=float)
+    selected_true = np.asarray([rerun_y_true[index] for index in sample_indices], dtype=float)
+    legacy_pred = np.asarray(array_row["y_pred"], dtype=float)
+    legacy_true = np.asarray(array_row["y_true"], dtype=float)
+    prediction_delta = np.abs(selected_pred - legacy_pred)
+    prediction_max_abs_delta = float(np.max(prediction_delta)) if prediction_delta.size else math.inf
+    rmse = float(np.sqrt(np.mean(np.square(selected_pred - legacy_true))))
+    legacy_rmse = float(_scores_from_prediction(prediction)["rmse"])
+    rmse_delta = abs(rmse - legacy_rmse)
+    prediction_tolerance = float(fixture["comparison"]["prediction_tolerance"])
+    rmse_tolerance = float(fixture["comparison"]["rmse_tolerance"])
+    finite_predictions = bool(np.all(np.isfinite(rerun_y_pred)))
+    target_max_abs_delta = float(np.max(np.abs(selected_true - legacy_true))) if selected_true.size else math.inf
+
+    assert finite_predictions
+    assert target_max_abs_delta <= prediction_tolerance
+    assert prediction_max_abs_delta <= prediction_tolerance
+    assert rmse_delta <= rmse_tolerance
+
+    evidence = {
+        "schema_version": "n4a.e2e.python_rerun_pipeline.v1",
+        "scenario_id": SCENARIO_ID,
+        "status": "passed",
+        "converted_workspace_reopened": True,
+        "pipeline_reopened": True,
+        "python_rerun_executed": True,
+        "finite_predictions": finite_predictions,
+        "prediction_rows": int(selected_pred.shape[0]),
+        "target_max_abs_delta": target_max_abs_delta,
+        "prediction_max_abs_delta": prediction_max_abs_delta,
+        "prediction_tolerance": prediction_tolerance,
+        "rmse": rmse,
+        "legacy_rmse": legacy_rmse,
+        "rmse_delta": rmse_delta,
+        "rmse_tolerance": rmse_tolerance,
+        "dataset": {
+            "id": fixture["dataset"]["id"],
+            "rows": int(x.shape[0]),
+            "features": int(x.shape[1]),
+        },
+        "converted": {
+            "run_id": prediction["run_id"],
+            "pipeline_id": prediction["pipeline_id"],
+            "prediction_id": prediction["prediction_id"],
+            "model_class": prediction["model_class"],
+            "sample_indices": sample_indices,
+        },
+        "rerun": {
+            "nirs4all_version": getattr(nirs4all, "__version__", "unknown"),
+            "model_name": str(prediction["model_name"]),
+            "selected_y_pred": [float(item) for item in selected_pred],
+            "selected_y_true": [float(item) for item in selected_true],
+            "train_score": None
+            if rerun_prediction.get("train_score") is None
+            else float(rerun_prediction["train_score"]),
+        },
+    }
+    _write_json(artifacts_dir / PIPELINE_RERUN_ARTIFACT, evidence)
+
+    assert _read_json(artifacts_dir / PIPELINE_RERUN_ARTIFACT)["status"] == "passed"

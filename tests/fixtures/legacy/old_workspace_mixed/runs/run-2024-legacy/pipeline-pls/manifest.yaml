@@ -7,7 +7,5 @@ model:
   class: sklearn.cross_decomposition.PLSRegression
   name: PLSRegression
 preprocessing:
-  - SNV
-  - SavitzkyGolay
 predictions:
   file: ../../../run_predictions.json

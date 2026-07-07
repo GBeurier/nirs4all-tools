@@ -1,0 +1,35 @@
+{
+  "schema_version": "n4a.tools.legacy_rerunnable_pipeline_fixture.v1",
+  "scenario_id": "e2e-converter-legacy-save-predictions-web",
+  "description": "Tiny deterministic PLS fixture used to prove that a converted legacy prediction can be reopened and rerun through the Python nirs4all oracle.",
+  "dataset": {
+    "id": "cassava-drymatter-2024",
+    "x": [[31.0], [30.1], [33.0], [35.0], [36.0], [37.0]],
+    "y": [31.0, 30.1, 33.0, 35.0, 36.0, 37.0]
+  },
+  "pipeline": [
+    {
+      "role": "split",
+      "class": "sklearn.model_selection.ShuffleSplit",
+      "params": {
+        "n_splits": 1,
+        "test_size": 0.5,
+        "random_state": 42
+      }
+    },
+    {
+      "role": "model",
+      "name": "PLSRegression",
+      "class": "sklearn.cross_decomposition.PLSRegression",
+      "params": {
+        "n_components": 1
+      }
+    }
+  ],
+  "comparison": {
+    "prediction_id": "pred-loose-001",
+    "sample_indices": [0, 1, 2],
+    "prediction_tolerance": 1e-6,
+    "rmse_tolerance": 1e-6
+  }
+}
