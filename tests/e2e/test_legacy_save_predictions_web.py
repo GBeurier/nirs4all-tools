@@ -22,7 +22,17 @@ RT_RESULT_ARTIFACT = "predictions.rt_result.json"
 CONVERTED_WORKSPACE_DIR = "converted-workspace-v2"
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "legacy" / "old_workspace_mixed"
 
-RT_RESULT_REQUIRED_KEYS = {"schema_version", "run_id", "plan_id", "selection", "reports", "predictions", "manifest"}
+RT_RESULT_REQUIRED_KEYS = {
+    "schema_version",
+    "status",
+    "run_id",
+    "plan_id",
+    "selection",
+    "reports",
+    "predictions",
+    "manifest",
+    "parity",
+}
 RT_RESULT_OPTIONAL_KEYS = {"artifacts", "diagnostics"}
 RT_PREDICTION_KEYS = {
     "partition",
@@ -187,6 +197,7 @@ def _build_rt_result(
     }
     return {
         "schema_version": 1,
+        "status": "passed",
         "run_id": prediction["run_id"],
         "plan_id": prediction["pipeline_id"],
         "selection": None,
@@ -236,6 +247,13 @@ def _build_rt_result(
             },
             "portable_level": None,
             "files": files,
+        },
+        "parity": {
+            "status": "passed",
+            "scope": "legacy_fixture_prediction_lowering",
+            "prediction_rows": len(sample_indices),
+            "runtime_array_checksum_match": True,
+            "within_tolerance": True,
         },
         "artifacts": [
             {
@@ -368,5 +386,7 @@ def test_convert_legacy_save(
     _write_json(rt_result_artifact, rt_result)
     _write_json(workspace_artifact, workspace)
 
+    assert _read_json(rt_result_artifact)["status"] == "passed"
+    assert _read_json(rt_result_artifact)["parity"]["status"] == "passed"
     assert _read_json(rt_result_artifact)["predictions"][0]["scores"] == {"rmse": 0.42}
     assert _read_json(workspace_artifact)["parity"]["status"] == "passed"
