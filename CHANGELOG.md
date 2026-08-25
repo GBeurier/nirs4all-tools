@@ -4,6 +4,14 @@ All notable changes to **nirs4all-tools** are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.6] — 2026-08-25
+
+### Fixed
+- The explicit trusted-PLS N4MM exporter now uses the public
+  `pls4all>=1.0.13` migration API instead of the private `n4m` module. A clean
+  install of the `n4mm-export` extra therefore has the same supported import
+  boundary as its published dependency.
+
 ## [0.0.4] — 2026-07-07
 
 Patch release for the V1 RC publication lane.

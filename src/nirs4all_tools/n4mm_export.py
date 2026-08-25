@@ -73,7 +73,7 @@ def export_trusted_joblib_n4mm(
         raise VerificationFailed(
             "Methods returned an empty N4MM payload",
             cause=vocab.CAUSE_RUNTIME_ERROR,
-            mitigation="verify that nirs4all-methods >= 1.0.11 is installed and retry",
+            mitigation="verify that pls4all >= 1.0.13 is installed and retry",
         )
     attestation = {
         "schema_version": "nirs4all-tools.n4mm-export-attestation.v1",
@@ -108,11 +108,11 @@ def _export_native_n4mm(predictor: Any) -> tuple[bytes, str]:
     """Use the released Methods binding without making it a base dependency."""
 
     try:
-        import n4m
-        from n4m.lowlevel.migration import export_linear_predictor_n4mm
+        import pls4all
+        from pls4all import export_linear_predictor_n4mm
     except ImportError as exc:
         raise UnsupportedInput(
-            "export-n4mm requires the n4mm-export extra (nirs4all-methods >= 1.0.11)",
+            "export-n4mm requires the n4mm-export extra (pls4all >= 1.0.13)",
             cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
             mitigation='install with: pip install "nirs4all-tools[n4mm-export]"',
         ) from exc
@@ -128,7 +128,7 @@ def _export_native_n4mm(predictor: Any) -> tuple[bytes, str]:
             cause=vocab.CAUSE_RUNTIME_ERROR,
             mitigation="verify the installed Methods ABI is 2.3.0 or newer",
         ) from exc
-    return bytes(payload), str(getattr(n4m, "__version__", "unknown"))
+    return bytes(payload), str(getattr(pls4all, "__version__", "unknown"))
 
 
 def _publish_fresh_export(output: Path, payload: bytes, attestation: dict[str, object]) -> None:
