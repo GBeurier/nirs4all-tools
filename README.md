@@ -40,6 +40,7 @@ Every command guarantees the source is never modified:
 pip install -e ".[dev]"          # scaffold core is pure standard library
 pip install -e ".[duckdb]"       # add DuckDB-source reading (optional)
 pip install -e ".[parquet]"      # add Parquet lowering/validation (optional)
+pip install -e ".[trusted-joblib]" # explicit, trusted sklearn PLS inspection only
 ```
 
 ## CLI
@@ -61,6 +62,11 @@ nirs4all-tools legacy verify <output-dir> --manifest PATH [--report PATH]
 ```
 
 Current schema-transform support is intentionally narrow:
+
+- an internal trusted-joblib preflight can derive a finite affine equation from
+  exactly a fitted sklearn `PLSRegression`; it does not accept pipelines or
+  arbitrary estimators, never runs automatically, and does not yet write a
+  target archive until the Methods N4MM import ABI is released;
 
 - `sqlite-workspace-legacy-arrays` metadata is lowered to `store.sqlite`
   schema v2;

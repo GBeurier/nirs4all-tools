@@ -40,6 +40,9 @@ dependencies = []
 duckdb = ["duckdb>=1.0.0"]
 # Required only to read/validate Parquet sidecars.
 parquet = ["pyarrow>=14.0.0"]
+# Required only for an explicitly trusted, exact sklearn PLS affine-equation
+# extraction.  This extra never enables automatic joblib loading.
+trusted-joblib = ["joblib>=1.2", "scikit-learn>=1.0"]
 # Required only to author a real Phase-1 nirs4all-workspace-v2 target store
 # (create_schema / ArrayStore) once the transform engine lands.
 target = ["nirs4all>=0.10.0"]
@@ -49,6 +52,8 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.7.0",
     "build>=1.0.0",
+    "joblib>=1.2",
+    "scikit-learn>=1.0",
 ]
 
 [project.scripts]
