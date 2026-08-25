@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 
 import joblib
 import numpy as np
@@ -11,7 +13,7 @@ from sklearn.cross_decomposition import PLSRegression
 
 from nirs4all_tools.errors import PolicyRefusal, UnsupportedInput
 from nirs4all_tools.exit_codes import ExitCode
-from nirs4all_tools.n4mm_export import export_trusted_joblib_n4mm
+from nirs4all_tools.n4mm_export import _export_native_n4mm, export_trusted_joblib_n4mm
 
 
 def _trusted_pls(path) -> None:
@@ -91,3 +93,23 @@ def test_export_refuses_existing_output_before_deserialization(tmp_path, monkeyp
             tool_version="0.0.5",
         )
     assert (output / "keep").read_text(encoding="utf-8") == "do not touch"
+
+
+def test_native_export_uses_only_the_public_pls4all_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[object, object, int]] = []
+    public = types.ModuleType("pls4all")
+    public.__version__ = "1.0.13+abi.2.3.0"
+
+    def export(coefficients, intercept, *, source_training_samples):
+        calls.append((coefficients, intercept, source_training_samples))
+        return b"N4MM\x01public"
+
+    public.export_linear_predictor_n4mm = export
+    monkeypatch.setitem(sys.modules, "pls4all", public)
+    monkeypatch.delitem(sys.modules, "n4m", raising=False)
+
+    predictor = types.SimpleNamespace(
+        coefficients=((1.0,),), intercept=(0.5,), source_training_samples=7
+    )
+    assert _export_native_n4mm(predictor) == (b"N4MM\x01public", "1.0.13+abi.2.3.0")
+    assert calls == [(predictor.coefficients, predictor.intercept, 7)]

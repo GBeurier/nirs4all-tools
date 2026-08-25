@@ -70,8 +70,9 @@ Current schema-transform support is intentionally narrow:
 
 - `legacy export-n4mm` can, only after explicit `--trusted-load-joblib`, prove
   a finite affine equation from exactly a fitted sklearn `PLSRegression` and
-  export it through Methods ABI 2.3 as a native PREDICT-only `model.n4mm` plus
-  an attestation. It refuses pipelines and arbitrary estimators, never runs
+  export it through the public `pls4all` binding (Methods ABI 2.3) as a native
+  PREDICT-only `model.n4mm` plus an attestation. It refuses pipelines and
+  arbitrary estimators, never runs
   automatically, and never fabricates a workspace or archive: a standalone
   joblib has no signed graph, score, cohort, or lineage evidence;
 
