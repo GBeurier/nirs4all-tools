@@ -41,6 +41,7 @@ pip install -e ".[dev]"          # scaffold core is pure standard library
 pip install -e ".[duckdb]"       # add DuckDB-source reading (optional)
 pip install -e ".[parquet]"      # add Parquet lowering/validation (optional)
 pip install -e ".[trusted-joblib]" # explicit, trusted sklearn PLS inspection only
+pip install -e ".[trusted-joblib,n4mm-export]" # opt-in trusted PLS -> PREDICT-only N4MM export
 ```
 
 ## CLI
@@ -59,14 +60,20 @@ nirs4all-tools legacy migrate <input> --output DIR --target nirs4all-workspace-v
 
 # Verify an output against its manifest (reads no source).
 nirs4all-tools legacy verify <output-dir> --manifest PATH [--report PATH]
+
+# Deliberately narrow: produces model.n4mm plus an attestation, never a
+# workspace or archive.  joblib is deserialized only with this explicit flag.
+nirs4all-tools legacy export-n4mm <trusted-pls.joblib> --output DIR --trusted-load-joblib
 ```
 
 Current schema-transform support is intentionally narrow:
 
-- an internal trusted-joblib preflight can derive a finite affine equation from
-  exactly a fitted sklearn `PLSRegression`; it does not accept pipelines or
-  arbitrary estimators, never runs automatically, and does not yet write a
-  target archive until the Methods N4MM import ABI is released;
+- `legacy export-n4mm` can, only after explicit `--trusted-load-joblib`, prove
+  a finite affine equation from exactly a fitted sklearn `PLSRegression` and
+  export it through Methods ABI 2.3 as a native PREDICT-only `model.n4mm` plus
+  an attestation. It refuses pipelines and arbitrary estimators, never runs
+  automatically, and never fabricates a workspace or archive: a standalone
+  joblib has no signed graph, score, cohort, or lineage evidence;
 
 - `sqlite-workspace-legacy-arrays` metadata is lowered to `store.sqlite`
   schema v2;

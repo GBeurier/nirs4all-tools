@@ -43,6 +43,9 @@ parquet = ["pyarrow>=14.0.0"]
 # Required only for an explicitly trusted, exact sklearn PLS affine-equation
 # extraction.  This extra never enables automatic joblib loading.
 trusted-joblib = ["joblib>=1.2", "scikit-learn>=1.0"]
+# Required only by the explicit PREDICT-only N4MM exporter.  The base CLI
+# never imports Methods or deserializes a joblib payload.
+n4mm-export = ["nirs4all-methods>=1.0.11"]
 # Required only to author a real Phase-1 nirs4all-workspace-v2 target store
 # (create_schema / ArrayStore) once the transform engine lands.
 target = ["nirs4all>=0.10.0"]

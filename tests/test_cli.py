@@ -55,6 +55,16 @@ def test_migrate_native_target_returns_twenty(sqlite_v2_workspace: Path, tmp_pat
     assert code == int(ExitCode.UNSUPPORTED_INPUT)
 
 
+def test_export_n4mm_requires_explicit_trusted_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    source = tmp_path / "trusted.joblib"
+    source.write_bytes(b"never opened")
+    assert main(["legacy", "export-n4mm", str(source), "--output", str(tmp_path / "out")]) == int(
+        ExitCode.UNSUPPORTED_INPUT
+    )
+    assert "requires --trusted-load-joblib" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
 def test_migrate_dry_run_returns_zero(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
     code = main(
         [
