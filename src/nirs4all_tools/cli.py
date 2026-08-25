@@ -10,6 +10,7 @@ nirs4all-tools legacy migrate <input> --output DIR --target nirs4all-workspace-v
                                       [--dry-run | --verify]
                                       [--strict | --best-effort]
                                       [--copy-only] [--resume] [--trusted-load-joblib]
+nirs4all-tools legacy export-n4mm <trusted-pls.joblib> --output DIR --trusted-load-joblib
 nirs4all-tools legacy verify <output-dir> --manifest PATH [--report PATH]
 ```
 """
@@ -24,6 +25,7 @@ from pathlib import Path
 from . import __version__, commands, vocab
 from .errors import ToolError
 from .exit_codes import ExitCode
+from .n4mm_export import export_trusted_joblib_n4mm
 
 _USAGE_ERROR = 2  # argparse convention for usage problems (distinct from domain codes)
 
@@ -54,6 +56,15 @@ def _cmd_migrate(args: argparse.Namespace) -> ExitCode:
 
 def _cmd_verify(args: argparse.Namespace) -> ExitCode:
     return commands.verify(args.output_dir, manifest_path=args.manifest, report_path=args.report)
+
+
+def _cmd_export_n4mm(args: argparse.Namespace) -> ExitCode:
+    return export_trusted_joblib_n4mm(
+        args.input,
+        output=args.output,
+        trusted_load_joblib=args.trusted_load_joblib,
+        tool_version=__version__,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -121,6 +132,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="opt-in to loading trusted joblib artifacts",
     )
     mig.set_defaults(func=_cmd_migrate)
+
+    n4mm = legacy_cmds.add_parser(
+        "export-n4mm",
+        help="explicitly export one trusted sklearn PLS joblib as a PREDICT-only N4MM",
+    )
+    n4mm.add_argument("input", type=Path, help="one explicitly trusted fitted sklearn PLSRegression joblib")
+    n4mm.add_argument("--output", type=Path, required=True, help="fresh output directory (outside the source)")
+    n4mm.add_argument(
+        "--trusted-load-joblib",
+        action="store_true",
+        help="required explicit acknowledgement that joblib deserialization is trusted",
+    )
+    n4mm.set_defaults(func=_cmd_export_n4mm)
 
     ver = legacy_cmds.add_parser("verify", help="verify an output against its manifest (reads no source)")
     ver.add_argument("output_dir", type=Path, metavar="output-dir", help="migrated output directory")
