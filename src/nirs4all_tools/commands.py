@@ -36,6 +36,12 @@ from .detect import (
     DetectionResult,
     detect_sources,
 )
+from .duckdb_workspace import (
+    DuckDBWorkspacePreview,
+    load_duckdb_workspace_preview,
+    lower_duckdb_workspace_preview,
+    runtime_array_records_from_duckdb_workspace,
+)
 from .errors import UnsupportedInput, VerificationFailed
 from .exit_codes import ExitCode
 from .legacy_runs import (
@@ -873,6 +879,8 @@ def _dry_run_unsupported_items(input_path: Path, detection: DetectionResult) -> 
     unsupported: list[dict[str, Any]] = []
     native_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_NATIVE_RESULTS_V1]
     standalone_native = len(native_artifacts) == 1 and len(detection.artifacts) == 1
+    duckdb_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_DUCKDB_WORKSPACE]
+    standalone_duckdb = len(duckdb_artifacts) == 1 and len(detection.artifacts) == 1
     loose_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_LOOSE_PREDICTIONS]
     standalone_loose = len(loose_artifacts) == 1 and len(detection.artifacts) == 1
     legacy_runs_artifacts = _legacy_runs_lowering_artifacts(detection)
@@ -881,6 +889,21 @@ def _dry_run_unsupported_items(input_path: Path, detection: DetectionResult) -> 
 
     for art in detection.artifacts:
         if art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS:
+            continue
+        if art.source_kind == KIND_DUCKDB_WORKSPACE and standalone_duckdb:
+            try:
+                load_duckdb_workspace_preview(_artifact_source_path(input_path, art))
+                if _pyarrow_runtime_array_schema() is None:
+                    raise _runtime_array_sidecar_unavailable()
+            except UnsupportedInput as exc:
+                unsupported.append(
+                    _unsupported_entry(
+                        art,
+                        reason=exc.message,
+                        disposition="would_preserve",
+                        cause=exc.cause,
+                    )
+                )
             continue
         if art is legacy_runs_main:
             try:
@@ -1105,6 +1128,44 @@ def migrate(
                 unsupported_report_path,
                 extra_opaque_artifacts=extra_opaque_artifacts,
                 strict=strict,
+                verify_after=verify,
+            )
+        duckdb_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_DUCKDB_WORKSPACE]
+        if len(duckdb_artifacts) == 1 and len(detection.artifacts) == 1:
+            duckdb_artifact = duckdb_artifacts[0]
+            try:
+                duckdb_preview = load_duckdb_workspace_preview(_artifact_source_path(input_path, duckdb_artifact))
+                if _pyarrow_runtime_array_schema() is None:
+                    raise _runtime_array_sidecar_unavailable()
+            except UnsupportedInput as exc:
+                if strict:
+                    raise
+                return _run_opaque_artifact_preservation(
+                    input_path,
+                    output,
+                    duckdb_artifacts,
+                    manifest,
+                    report,
+                    manifest_path,
+                    report_path,
+                    id_map_path,
+                    unsupported_report_path,
+                    strict=False,
+                    verify_after=verify,
+                    unsupported_reason=exc.message,
+                    unsupported_cause=exc.cause,
+                )
+            return _run_duckdb_workspace_preview_transform(
+                input_path,
+                output,
+                duckdb_artifact,
+                duckdb_preview,
+                manifest,
+                report,
+                manifest_path,
+                report_path,
+                id_map_path,
+                unsupported_report_path,
                 verify_after=verify,
             )
         native_artifacts = [art for art in detection.artifacts if art.source_kind == KIND_NATIVE_RESULTS_V1]
@@ -1565,6 +1626,105 @@ def _run_sqlite_legacy_arrays_transform(
             raise
     finally:
         source.close()
+
+
+def _run_duckdb_workspace_preview_transform(
+    input_path: Path,
+    output: Path,
+    artifact: DetectedArtifact,
+    preview: DuckDBWorkspacePreview,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    unsupported_report_path: Path | None,
+    *,
+    verify_after: bool = False,
+) -> ExitCode:
+    """Lower one fully validated strict DuckDB workspace to workspace-v2."""
+    if _pyarrow_runtime_array_schema() is None:
+        raise _runtime_array_sidecar_unavailable()
+    created = not output.exists()
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        target_store = output / "store.sqlite"
+        target = sqlite3.connect(target_store)
+        try:
+            create_workspace_v2_schema(target)
+            lower_duckdb_workspace_preview(target, preview)
+            target.commit()
+            target_counts = _target_row_counts(target)
+        finally:
+            target.close()
+
+        source = _artifact_source_path(input_path, artifact)
+        rel = _artifact_preserved_rel(input_path, artifact)
+        source_checksums = _copy_preserved_artifact(source, output / rel, rel)
+        array_records = runtime_array_records_from_duckdb_workspace(preview)
+        runtime_array_checksums, runtime_array_inventory = _write_runtime_array_records(output, array_records)
+        checksums = {"store.sqlite": sha256_file(target_store), **runtime_array_checksums, **source_checksums}
+
+        manifest["checksums"] = checksums
+        manifest["output_inventory"] = [
+            {
+                "path": "store.sqlite",
+                "tables": {table: {} for table in WORKSPACE_V2_TABLES},
+                "row_counts": target_counts,
+                "generated_manifests": _generated_contract_names(),
+            },
+            *runtime_array_inventory,
+            {
+                "path": rel,
+                "tables": {},
+                "row_counts": {"files": len(source_checksums)},
+                "generated_manifests": [],
+            },
+        ]
+        manifest["tool"]["completed_at"] = _now_iso()
+
+        report["status"] = vocab.STATUS_SUCCESS
+        report["source_summary"]["row_counts"] = {table: len(rows) for table, rows in preview.rows.items()}
+        report["target_summary"]["kind"] = vocab.TARGET_WORKSPACE_V2
+        report["target_summary"]["preview"] = {
+            "duckdb_workspace_closed_profile": True,
+            "duckdb_array_sidecars": bool(array_records),
+            "source_payload_preserved": rel,
+        }
+        report["migrated_counts"].update(
+            {
+                "runs": target_counts["runs"],
+                "pipelines": target_counts["pipelines"],
+                "chains": target_counts["chains"],
+                "predictions": target_counts["predictions"],
+                "artifacts": target_counts["artifacts"],
+                "arrays": len(array_records),
+            }
+        )
+        report["preserved_counts"]["duckdb_source_payloads"] = 1
+        report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+
+        if manifest_path is not None:
+            _write_json(manifest_path, manifest)
+        _write_unsupported_report(
+            unsupported_report_path,
+            manifest=manifest,
+            report=report,
+            target_path=output,
+        )
+        if verify_after:
+            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            _raise_if_verification_failed(report["verification_summary"])
+        if report_path is not None:
+            _write_json(report_path, report)
+        if id_map_path is not None:
+            _write_json(id_map_path, manifest["old_to_new_ids"])
+        return ExitCode.SUCCESS
+    except Exception:
+        if created and output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+        raise
 
 
 def _run_native_results_preview_transform(
