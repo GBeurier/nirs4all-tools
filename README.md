@@ -19,8 +19,8 @@ their predictions/pipelines without the runtime ever opening a legacy store.
 > checksummed JSONL audit provenance. A native-results-v1 preview can lower one
 > current dag-ml native results directory into runtime-readable workspace-v2
 > metadata plus array sidecars after strict hash/schema preflight. One closed
-> historical DuckDB profile can lower a single run/pipeline/chain with flat
-> arrays after read-only schema and relation preflight. A legacy
+> historical DuckDB profile can lower a validated multi-run/pipeline/chain graph
+> with flat arrays after read-only schema and relation preflight. A legacy
 > `runs/*/*/manifest.yaml` preview can lower one completed run when it references
 > one complete `*_predictions.json` payload and the YAML/JSON metadata agree.
 
@@ -85,10 +85,11 @@ Current schema-transform support is intentionally narrow:
   in `preserved/legacy-prediction-arrays.jsonl` for audit;
 - one standalone `store.duckdb` in the exact historical six-table profile is
   lowered to workspace-v2 metadata plus flat runtime array sidecars when both
-  the `duckdb` and `parquet` extras are installed. It accepts exactly one
-  run/pipeline/chain, complete foreign keys, finite equal-length arrays, no
-  artifact tables, serialized chain steps, or sibling source files; the original database
-  remains checksummed under `preserved/duckdb-workspace/`;
+  the `duckdb` and `parquet` extras are installed. It accepts a closed graph of
+  runs, pipelines, chains, predictions, logs, and complete finite equal-length
+  arrays; it refuses artifact references, sidecar filename collisions, unknown
+  source files, and broken graph ownership before output creation. The original
+  database remains checksummed under `preserved/duckdb-workspace/`;
 - one standalone current dag-ml `native-results-v1` directory with a valid
   `score_set_hash` and canonical `predictions.parquet` projection is lowered to
   workspace-v2 run/pipeline/chain/prediction/artifact metadata plus
