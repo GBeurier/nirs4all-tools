@@ -142,11 +142,46 @@ def _read_exact(handle: Any, size: int, *, rule: str, detail: str) -> bytes:
 
 
 def _open_archive_file(path: Path) -> Any:
-    """Open an archive descriptor without ever blocking on a FIFO replacement."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-    for optional_flag in ("O_CLOEXEC", "O_NOFOLLOW", "O_BINARY"):
-        flags |= getattr(os, optional_flag, 0)
-    descriptor = os.open(path, flags)
+    """Open an archive with the strongest no-follow semantics the OS exposes.
+
+    CLI commands canonicalize their one user-provided root symlink before this
+    point.  Nested archives must instead stay beneath their already-validated
+    source tree.  POSIX descriptor-relative opens bind every component; the
+    portable fallback preserves the existing final-path no-follow behavior
+    where available and relies on the command-level source-shape preflight.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    flags = os.O_RDONLY | int(getattr(os, "O_NONBLOCK", 0))
+    if isinstance(nofollow, int):
+        flags |= nofollow
+    for optional_flag in ("O_CLOEXEC", "O_BINARY"):
+        flags |= int(getattr(os, optional_flag, 0))
+    component_nofollow = (
+        isinstance(nofollow, int)
+        and isinstance(directory_flag, int)
+        and os.open in os.supports_dir_fd
+    )
+    if not component_nofollow:
+        descriptor = os.open(path, flags)
+    else:
+        assert isinstance(directory_flag, int)
+        directory_flags = flags | directory_flag
+        absolute = Path(os.path.abspath(os.fspath(path)))
+        parts = absolute.parts
+        if len(parts) < 2 or not absolute.is_absolute():
+            raise OSError("archive path cannot be opened component-by-component")
+        current_fd: int | None = None
+        try:
+            current_fd = os.open(parts[0], directory_flags)
+            for component in parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            descriptor = os.open(parts[-1], flags, dir_fd=current_fd)
+        finally:
+            if current_fd is not None:
+                os.close(current_fd)
     try:
         return os.fdopen(descriptor, "rb")
     except Exception:

@@ -33,9 +33,14 @@ Every command guarantees the source is never modified:
   (aliasing / nesting is refused, exit `40`);
 - the output must be **empty**; `--resume` is only a read-only, attested no-op
   for an already complete output, never a continuation of a partial migration;
-- the whole source tree is snapshotted `(path, size, mtime_ns)` before and after
-  **every** run — including failure and abort paths — and asserted byte-for-byte
-  identical (a mismatch is exit `70`).
+- `inspect` and `migrate` materialize a private descriptor-bound, no-follow
+  source view before detection, parsing, transforms, or payload copies; the
+  original source is rechecked before completion (a mismatch is exit `70`);
+- that secure materialization requires POSIX `O_NOFOLLOW`, `O_DIRECTORY`, and
+  descriptor-relative (`dir_fd`) operations.  Where they are unavailable,
+  source-consuming commands fail closed with unsupported capability rather
+  than fall back to path traversal.  It needs temporary space roughly equal
+  to the source, and `TMPDIR` must resolve outside both source and output.
 
 ## Install
 

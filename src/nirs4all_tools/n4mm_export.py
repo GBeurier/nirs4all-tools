@@ -12,15 +12,23 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from . import vocab
-from .checksums import sha256_bytes, sha256_file
-from .errors import PolicyRefusal, UnsupportedInput, VerificationFailed
+from .checksums import sha256_bytes
+from .errors import PolicyRefusal, SourceIntegrityError, UnsupportedInput, VerificationFailed
 from .exit_codes import ExitCode
-from .policy import assert_disjoint, assert_output_available, source_guard
+from .policy import (
+    assert_disjoint,
+    assert_output_available,
+    assert_safe_source_tree,
+    materialized_source_tree_nofollow,
+    realpath,
+    source_guard_nofollow,
+)
 from .trusted_joblib import TrustedJoblibRefusal, load_trusted_sklearn_pls_affine
 
 _MODEL_NAME = "model.n4mm"
@@ -48,18 +56,37 @@ def export_trusted_joblib_n4mm(
             cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
             mitigation="pass --trusted-load-joblib only for a source you explicitly trust",
         )
-    if not source.is_file():
+    # The one root supplied by the user may be an alias; resolve it once, then
+    # never hand the original pathname to the trusted deserializer.  The
+    # materialized no-follow stage below binds the bytes before joblib opens
+    # them, so a leaf substitution cannot become executable input.
+    source_path = realpath(source)
+    assert_safe_source_tree(source_path)
+    try:
+        source_mode = os.lstat(source_path).st_mode
+    except OSError:
+        source_mode = 0
+    if not stat.S_ISREG(source_mode):
         raise UnsupportedInput(
             "export-n4mm source must be a regular trusted joblib file",
             cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
             mitigation="supply one fitted sklearn PLSRegression joblib file",
         )
-    assert_disjoint(source, output)
+    assert_disjoint(source_path, output, source_is_canonical=True)
     assert_output_available(output, resume=False)
 
-    with source_guard(source):
+    with materialized_source_tree_nofollow(
+        source_path, forbidden_paths=(output,), source_is_canonical=True
+    ) as staged_source, source_guard_nofollow(source_path, before=staged_source.source_snapshot):
+        source_digest = staged_source.source_snapshot.entries.get(".", (0, 0, None))[2]
+        if not isinstance(source_digest, str):
+            raise SourceIntegrityError(
+                "private source stage lacks a bound regular-file digest",
+                cause=vocab.CAUSE_RUNTIME_ERROR,
+                mitigation="rerun export against a stable trusted joblib file",
+            )
         try:
-            predictor = load_trusted_sklearn_pls_affine(source)
+            predictor = load_trusted_sklearn_pls_affine(staged_source.path)
         except TrustedJoblibRefusal as exc:
             raise UnsupportedInput(
                 f"trusted PLS preflight refused the source: {exc}",
@@ -67,7 +94,6 @@ def export_trusted_joblib_n4mm(
                 mitigation="use exactly a fitted sklearn.cross_decomposition.PLSRegression with finite state",
             ) from exc
         payload, methods_version = _export_native_n4mm(predictor)
-        source_digest = sha256_file(source)
 
     if not payload:
         raise VerificationFailed(

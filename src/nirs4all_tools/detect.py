@@ -15,14 +15,16 @@ for the gated transform engine.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
 from .n4a_archive import N4aArchiveRefusal, inspect_n4a_archive
 from .native_results import NATIVE_RESULTS_LOWERING_SCHEMA_VERSION
-from .policy import read_only_sqlite_uri
+from .policy import assert_safe_source_tree, read_only_sqlite_uri, realpath
 
 # --- source_kind constants (spec §4 table) ---------------------------------
 KIND_DUCKDB_WORKSPACE: Final = "duckdb-workspace"
@@ -271,18 +273,46 @@ def _detect_directory(root: Path, result: DetectionResult) -> None:
             result.artifacts.append(native_child)
 
 
-def detect_sources(input_path: Path) -> DetectionResult:
+def detect_sources(input_path: Path, *, allow_root_symlink: bool = True) -> DetectionResult:
     """Detect the legacy artifact(s) at ``input_path`` (read-only, stat-first).
 
     Args:
         input_path: A workspace directory, a ``.n4a`` / ``.n4a.py`` bundle file,
             or a native-results directory.
+        allow_root_symlink: Whether this direct public entry point may resolve
+            its one user-supplied root symlink.  Internal callers that inspect
+            a discovered descendant pass ``False`` so a nested symlink can
+            never become a newly trusted root.
 
     Returns:
         A :class:`DetectionResult`; an unrecognized but existing source yields a
         single ``unknown`` artifact rather than an empty result.
     """
     root = Path(input_path)
+    # Public callers historically passed a directory or archive alias here.
+    # Preserve that single-root convenience, but make internal nested calls
+    # opt out explicitly: only the original user-supplied root may be
+    # canonicalized into a trusted traversal root.
+    try:
+        root_mode = os.lstat(root).st_mode
+    except FileNotFoundError:
+        root_mode = 0
+    except OSError:
+        assert_safe_source_tree(root)
+        root_mode = 0
+    if stat.S_ISLNK(root_mode):
+        if not allow_root_symlink:
+            assert_safe_source_tree(root)
+        root = realpath(root)
+        try:
+            root_mode = os.lstat(root).st_mode
+        except FileNotFoundError:
+            root_mode = 0
+        except OSError:
+            assert_safe_source_tree(root)
+            root_mode = 0
+    if stat.S_ISREG(root_mode) or stat.S_ISDIR(root_mode):
+        assert_safe_source_tree(root)
     result = DetectionResult(root=str(root))
     if not root.exists():
         result.artifacts.append(_unknown("path does not exist"))

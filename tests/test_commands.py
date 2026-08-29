@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import stat
 import zipfile
@@ -165,6 +166,99 @@ def test_migrate_unknown_source_is_unsupported(tmp_path: Path) -> None:
         commands.migrate(
             empty, output=tmp_path / "out", target=vocab.TARGET_WORKSPACE_V2, copy_only=True, tool_version="0.0.1"
         )
+
+
+def test_inspect_and_migrate_refuse_descendant_symlink_before_output(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside.sqlite"
+    outside.write_bytes(b"outside")
+    try:
+        os.symlink(outside, sqlite_v2_workspace / "escaped.sqlite")
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+    with pytest.raises(UnsupportedInput) as inspect_error:
+        commands.inspect(sqlite_v2_workspace, fmt="json")
+    assert inspect_error.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+
+    output = tmp_path / "out"
+    with pytest.raises(UnsupportedInput) as migrate_error:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=output,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+    assert migrate_error.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert not output.exists()
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="the platform does not support FIFO nodes")
+def test_inspect_and_migrate_refuse_descendant_fifo_before_output(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+) -> None:
+    os.mkfifo(sqlite_v2_workspace / "blocked.fifo")
+
+    with pytest.raises(UnsupportedInput) as inspect_error:
+        commands.inspect(sqlite_v2_workspace, fmt="json")
+    assert inspect_error.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+
+    output = tmp_path / "out"
+    with pytest.raises(UnsupportedInput) as migrate_error:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=output,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+    assert migrate_error.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert not output.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the platform does not support Unix sockets")
+def test_migrate_refuses_descendant_socket_before_output(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+    socket_path = sqlite_v2_workspace / "blocked.socket"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(socket_path))
+        with pytest.raises(UnsupportedInput) as raised:
+            commands.migrate(
+                sqlite_v2_workspace,
+                output=tmp_path / "out",
+                target=vocab.TARGET_WORKSPACE_V2,
+                copy_only=True,
+                tool_version="0.0.1",
+            )
+        assert raised.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+        assert not (tmp_path / "out").exists()
+    finally:
+        server.close()
+
+
+def test_migrate_refuses_unreadable_descendant_before_output(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+    unreadable = sqlite_v2_workspace / "unreadable.bin"
+    unreadable.write_bytes(b"private")
+    unreadable.chmod(0)
+    try:
+        with pytest.raises(UnsupportedInput) as raised:
+            commands.migrate(
+                sqlite_v2_workspace,
+                output=tmp_path / "out",
+                target=vocab.TARGET_WORKSPACE_V2,
+                copy_only=True,
+                tool_version="0.0.1",
+            )
+        assert raised.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+        assert not (tmp_path / "out").exists()
+    finally:
+        unreadable.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 # --- migrate: dry-run ------------------------------------------------------
@@ -635,6 +729,74 @@ def test_migrate_sqlite_legacy_arrays_strict_lowers_without_warnings(
     assert report["warnings"] == []
 
 
+def test_migrate_refuses_restored_store_sqlite_symlink_before_output(
+    sqlite_legacy_arrays_workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-stage SQLite leaf swap cannot redirect the transform reader."""
+    pytest.importorskip("pyarrow")
+    store = sqlite_legacy_arrays_workspace / "store.sqlite"
+    source_bytes = store.read_bytes()
+    external = tmp_path / "external.sqlite"
+    external.write_bytes(source_bytes)
+    external_connection = sqlite3.connect(external)
+    try:
+        external_connection.execute("UPDATE predictions SET prediction_id = 'external-prediction'")
+        external_connection.execute("UPDATE prediction_arrays SET prediction_id = 'external-prediction'")
+        external_connection.commit()
+    finally:
+        external_connection.close()
+    held_store = tmp_path / "held-store.sqlite"
+    original_uri = commands.read_only_sqlite_uri
+    swapped = False
+    saw_private_stage = False
+
+    def uri_while_original_leaf_is_an_external_symlink(path: Path) -> str:
+        nonlocal saw_private_stage, swapped
+        if swapped:
+            return original_uri(path)
+        reader_path = Path(path)
+        # This is the transform's source reader.  Assert the test would fail
+        # if a future refactor handed it the user-controlled source pathname:
+        # the root is the private TemporaryDirectory and the staged bytes are
+        # still the original payload before the hostile source swap begins.
+        assert reader_path != store
+        assert reader_path.parent.name == sqlite_legacy_arrays_workspace.name
+        assert reader_path.parent.parent.name.startswith("nirs4all-tools-source-")
+        assert reader_path.read_bytes() == source_bytes
+        saw_private_stage = True
+        swapped = True
+        store.rename(held_store)
+        try:
+            os.symlink(external, store)
+        except OSError as exc:
+            held_store.rename(store)
+            pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+        try:
+            return original_uri(path)
+        finally:
+            store.unlink()
+            held_store.rename(store)
+
+    monkeypatch.setattr(commands, "read_only_sqlite_uri", uri_while_original_leaf_is_an_external_symlink)
+    output = tmp_path / "out"
+
+    with pytest.raises(SourceIntegrityError):
+        commands.migrate(
+            sqlite_legacy_arrays_workspace,
+            output=output,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            verify=True,
+            tool_version="0.0.1",
+        )
+
+    assert saw_private_stage
+    assert store.read_bytes() == source_bytes
+    assert not output.exists()
+
+
 def _make_legacy_arrays_length_mismatch_workspace(root: Path) -> Path:
     """A legacy-arrays workspace whose single row has mismatched y_true/y_pred lengths.
 
@@ -959,6 +1121,87 @@ def test_migrate_loose_predictions_nonfinite_array_refuses_cleanly(tmp_path: Pat
     assert "non-finite" in exc.value.message
     assert not out.exists()
     assert policy.diff_snapshots(before, after) == []
+
+
+def test_migrate_refuses_restored_loose_prediction_symlink_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A preview cannot consume a descendant symlink substituted after staging."""
+    pytest.importorskip("pyarrow")
+    source = tmp_path / "loose"
+    source.mkdir()
+
+    def record(prediction_id: str) -> dict[str, object]:
+        return {
+            "run_id": "run-1",
+            "pipeline_id": "pipe-1",
+            "prediction_id": prediction_id,
+            "dataset": "dataset-a",
+            "model_name": "PLSRegression",
+            "model_class": "sklearn.cross_decomposition.PLSRegression",
+            "fold_id": "fold-0",
+            "partition": "val",
+            "metric": "rmse",
+            "task_type": "regression",
+            "sample_indices": [0, 1, 2],
+            "y_true": [1.0, 2.0, 3.0],
+            "y_pred": [1.1, 1.9, 3.2],
+        }
+
+    prediction = source / "run_predictions.json"
+    prediction.write_text(json.dumps(record("original-prediction")), encoding="utf-8")
+    source_bytes = prediction.read_bytes()
+    external = tmp_path / "external_predictions.json"
+    external.write_text(json.dumps(record("external-prediction")), encoding="utf-8")
+    held_prediction = tmp_path / "held_predictions.json"
+    original_preview = commands.load_loose_predictions_preview
+    swapped = False
+    saw_private_stage = False
+
+    def preview_while_original_leaf_is_an_external_symlink(*args, **kwargs):
+        nonlocal saw_private_stage, swapped
+        if swapped:
+            return original_preview(*args, **kwargs)
+        reader_root = Path(args[0])
+        # Prove that the preview reader is rooted at the private stage before
+        # changing the user source.  An unsafe pathname reader reaches the
+        # original root and fails this assertion instead of passing merely
+        # because the final integrity guard notices the restored swap.
+        assert reader_root != source
+        assert reader_root.name == source.name
+        assert reader_root.parent.name.startswith("nirs4all-tools-source-")
+        assert (reader_root / prediction.name).read_bytes() == source_bytes
+        saw_private_stage = True
+        swapped = True
+        prediction.rename(held_prediction)
+        try:
+            os.symlink(external, prediction)
+        except OSError as exc:
+            held_prediction.rename(prediction)
+            pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+        try:
+            return original_preview(*args, **kwargs)
+        finally:
+            prediction.unlink()
+            held_prediction.rename(prediction)
+
+    monkeypatch.setattr(commands, "load_loose_predictions_preview", preview_while_original_leaf_is_an_external_symlink)
+    output = tmp_path / "out"
+
+    with pytest.raises(SourceIntegrityError):
+        commands.migrate(
+            source,
+            output=output,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            verify=True,
+            tool_version="0.0.1",
+        )
+
+    assert saw_private_stage
+    assert prediction.read_bytes() == source_bytes
+    assert not output.exists()
 
 
 def test_migrate_native_results_lowers_preview_metadata(lowerable_native_results_dir: Path, tmp_path: Path) -> None:
@@ -1387,7 +1630,7 @@ def test_migrate_binds_n4a_output_to_its_initial_source_fingerprint(
 
 
 @pytest.mark.parametrize("copy_only", [False, True])
-def test_migrate_binds_n4a_copy_to_its_initial_content_digest(
+def test_migrate_removes_output_when_root_n4a_changes_and_restores(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     copy_only: bool,
@@ -1422,7 +1665,7 @@ def test_migrate_binds_n4a_copy_to_its_initial_content_digest(
     monkeypatch.setattr(commands, "_assert_source_fingerprint_matches", replace_after_fingerprint)
     monkeypatch.setattr(commands, "copy_validated_n4a_archive", restore_after_copy_attempt)
 
-    with pytest.raises(UnsupportedInput) as raised:
+    with pytest.raises(SourceIntegrityError):
         commands.migrate(
             source,
             output=out,
@@ -1431,49 +1674,53 @@ def test_migrate_binds_n4a_copy_to_its_initial_content_digest(
             tool_version="0.0.1",
         )
 
-    assert raised.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
-    assert "content digest changed" in raised.value.message
     assert source.read_bytes() == source_bytes
     assert not out.exists()
 
 
-def test_migrate_dry_run_refreshes_n4a_detection_after_initial_snapshot(
+def test_migrate_dry_run_refuses_root_n4a_symlink_swap_even_when_restored(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "model.n4a"
     with zipfile.ZipFile(source, "w") as archive:
         archive.writestr("manifest.json", '{"bundle_format_version":"1.0"}')
+    external = tmp_path / "external.n4a"
+    with zipfile.ZipFile(external, "w") as archive:
+        archive.writestr("manifest.json", '{"bundle_format_version":"2.0"}')
     out = tmp_path / "out"
     manifest_path = tmp_path / "preview-manifest.json"
     unsupported_path = tmp_path / "unsupported.json"
-    original_build_manifest = commands.contracts.build_manifest
+    held_source = tmp_path / "held-model.n4a"
+    original_refresh = commands._refresh_dry_run_detection
 
-    def replace_source_after_initial_detection(*args, **kwargs):
-        manifest = original_build_manifest(*args, **kwargs)
-        with zipfile.ZipFile(source, "w") as archive:
-            archive.writestr("manifest.json", '{"bundle_format_version":"2.0"}')
-        return manifest
+    def read_through_temporary_external_symlink(*args, **kwargs):
+        source.rename(held_source)
+        try:
+            os.symlink(external, source)
+        except OSError as exc:
+            held_source.rename(source)
+            pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+        try:
+            return original_refresh(*args, **kwargs)
+        finally:
+            source.unlink()
+            held_source.rename(source)
 
-    monkeypatch.setattr(commands.contracts, "build_manifest", replace_source_after_initial_detection)
+    monkeypatch.setattr(commands, "_refresh_dry_run_detection", read_through_temporary_external_symlink)
 
-    code = commands.migrate(
-        source,
-        output=out,
-        target=vocab.TARGET_WORKSPACE_V2,
-        dry_run=True,
-        manifest_path=manifest_path,
-        unsupported_report_path=unsupported_path,
-        tool_version="0.0.1",
-    )
+    with pytest.raises(SourceIntegrityError):
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            dry_run=True,
+            manifest_path=manifest_path,
+            unsupported_report_path=unsupported_path,
+            tool_version="0.0.1",
+        )
 
-    assert code == ExitCode.UNSUPPORTED_INPUT
     assert not out.exists()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["source"]["detected_versions"] == {"n4a-bundle": "2.0"}
-    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
-    assert unsupported["unsupported"][0]["cause"] == vocab.CAUSE_FORWARD_VERSION
-    assert unsupported["unsupported"][0]["disposition"] == "refused"
 
 
 def test_migrate_refuses_inert_strict_on_copy_only(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
@@ -1579,6 +1826,41 @@ def test_migrate_resume_copy_only_is_a_read_only_attested_noop(sqlite_v2_workspa
 
     assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
     assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_migrate_resume_uses_descriptor_snapshot_without_private_staging(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out = tmp_path / "out"
+    assert (
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+        == ExitCode.SUCCESS
+    )
+
+    def staging_must_not_run(*args, **kwargs):
+        raise AssertionError("--resume must not require a source-sized private stage")
+
+    monkeypatch.setattr(commands, "materialized_source_tree_nofollow", staging_must_not_run)
+
+    assert (
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+        == ExitCode.SUCCESS
+    )
 
 
 @pytest.mark.parametrize(
