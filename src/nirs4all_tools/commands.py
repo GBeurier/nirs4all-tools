@@ -36,6 +36,7 @@ from .detect import (
     DetectedArtifact,
     DetectionResult,
     detect_sources,
+    is_n4a_bundle_name,
 )
 from .duckdb_workspace import (
     DuckDBWorkspacePreview,
@@ -226,6 +227,45 @@ def _expected_n4a_content_digest(artifact: DetectedArtifact) -> str:
     return digest
 
 
+def _copy_validated_detected_n4a_archive(
+    source: Path,
+    destination: Path,
+    artifact: DetectedArtifact,
+) -> None:
+    """Copy one detector-bound N4A only after its descriptor validation."""
+    try:
+        copy_validated_n4a_archive(
+            source,
+            destination,
+            expected_bundle_format_version=artifact.detected_version,
+            expected_content_sha256=_expected_n4a_content_digest(artifact),
+        )
+    except N4aArchiveRefusal as refusal:
+        raise _n4a_archive_refusal(artifact, refusal) from refusal
+
+
+def _copy_recursive_n4a_archive(source: Path, destination: Path, *, relative_path: str) -> None:
+    """Detect, gate, and copy a nested opaque N4A with the direct-file path."""
+    detection = detect_sources(source)
+    if len(detection.artifacts) != 1 or detection.artifacts[0].source_kind != KIND_N4A_BUNDLE:
+        raise SourceIntegrityError(
+            f"nested .n4a source changed before it could be copied: {relative_path}",
+            cause=vocab.CAUSE_RUNTIME_ERROR,
+            mitigation="rerun migration against a stable source tree",
+        )
+    artifact = detection.artifacts[0]
+    artifact.path = relative_path
+    if artifact.forward_version:
+        raise UnsupportedInput(
+            f"source declares a version newer than this tool supports: {artifact.path}({artifact.detected_version})",
+            cause=vocab.CAUSE_FORWARD_VERSION,
+            mitigation="upgrade nirs4all-tools to a build that supports this source version",
+        )
+    if not artifact.supported:
+        _refuse_unsupported_detected_n4a_archives(detection)
+    _copy_validated_detected_n4a_archive(source, destination, artifact)
+
+
 def _refresh_dry_run_detection(
     input_path: Path,
     manifest: dict[str, Any],
@@ -386,15 +426,7 @@ def _copy_only(
         key = f"{_PAYLOAD_DIRNAME}/{src_real.name}"
         artifact = n4a_by_path.get(".")
         if artifact is not None:
-            try:
-                copy_validated_n4a_archive(
-                    src_real,
-                    dest,
-                    expected_bundle_format_version=artifact.detected_version,
-                    expected_content_sha256=_expected_n4a_content_digest(artifact),
-                )
-            except N4aArchiveRefusal as refusal:
-                raise _n4a_archive_refusal(artifact, refusal) from refusal
+            _copy_validated_detected_n4a_archive(src_real, dest, artifact)
         else:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_real, dest)
@@ -408,15 +440,9 @@ def _copy_only(
             dest = payload_root / rel
             artifact = n4a_by_path.get(rel)
             if artifact is not None:
-                try:
-                    copy_validated_n4a_archive(
-                        src_file,
-                        dest,
-                        expected_bundle_format_version=artifact.detected_version,
-                        expected_content_sha256=_expected_n4a_content_digest(artifact),
-                    )
-                except N4aArchiveRefusal as refusal:
-                    raise _n4a_archive_refusal(artifact, refusal) from refusal
+                _copy_validated_detected_n4a_archive(src_file, dest, artifact)
+            elif is_n4a_bundle_name(src_file.name):
+                _copy_recursive_n4a_archive(src_file, dest, relative_path=rel)
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_file, dest)
@@ -924,16 +950,22 @@ def _copy_preserved_artifact(source: Path, dest: Path, rel_prefix: str) -> dict[
     """Copy one opaque artifact and return file-level checksums keyed by output path."""
     checksums: dict[str, str] = {}
     if source.is_file():
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, dest)
+        if is_n4a_bundle_name(source.name):
+            _copy_recursive_n4a_archive(source, dest, relative_path=source.name)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest)
         checksums[rel_prefix] = sha256_file(dest)
         return checksums
 
     for src_file in sorted(path for path in source.rglob("*") if path.is_file()):
         rel = src_file.relative_to(source).as_posix()
         dst_file = dest / rel
-        dst_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_file, dst_file)
+        if is_n4a_bundle_name(src_file.name):
+            _copy_recursive_n4a_archive(src_file, dst_file, relative_path=rel)
+        else:
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst_file)
         checksums[f"{rel_prefix}/{rel}"] = sha256_file(dst_file)
     return checksums
 
@@ -964,15 +996,7 @@ def _copy_preserved_detected_artifact(
 
     source = _artifact_source_path(input_path, art)
     if art.source_kind == KIND_N4A_BUNDLE:
-        try:
-            copy_validated_n4a_archive(
-                source,
-                output / rel,
-                expected_bundle_format_version=art.detected_version,
-                expected_content_sha256=_expected_n4a_content_digest(art),
-            )
-        except N4aArchiveRefusal as refusal:
-            raise _n4a_archive_refusal(art, refusal) from refusal
+        _copy_validated_detected_n4a_archive(source, output / rel, art)
         return rel, {rel: sha256_file(output / rel)}
     return rel, _copy_preserved_artifact(source, output / rel, rel)
 

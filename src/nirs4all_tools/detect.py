@@ -92,6 +92,16 @@ class DetectionResult:
         return [art for art in self.artifacts if art.forward_version]
 
 
+def is_n4a_bundle_name(name: str) -> bool:
+    """Return whether a portable filesystem name denotes an N4A ZIP bundle."""
+    return name.casefold().endswith(".n4a")
+
+
+def _is_n4a_py_bundle_name(name: str) -> bool:
+    """Return whether a portable filesystem name denotes an embedded N4A bundle."""
+    return name.casefold().endswith(".n4a.py")
+
+
 def _unknown(note: str) -> DetectedArtifact:
     """Return the standard unrecognized-source marker."""
     return DetectedArtifact(path=".", source_kind=KIND_UNKNOWN, supported=False, note=note)
@@ -244,9 +254,10 @@ def _detect_directory(root: Path, result: DetectionResult) -> None:
             DetectedArtifact(path=".", source_kind=KIND_LOOSE_PREDICTIONS, details={"files": loose})
         )
 
-    for bundle in sorted(root.glob("*.n4a")):
+    children = sorted(root.iterdir())
+    for bundle in (path for path in children if is_n4a_bundle_name(path.name)):
         result.artifacts.append(_detect_n4a_bundle(bundle, bundle.name))
-    for py_bundle in sorted(root.glob("*.n4a.py")):
+    for py_bundle in (path for path in children if _is_n4a_py_bundle_name(path.name)):
         result.artifacts.append(
             DetectedArtifact(path=py_bundle.name, source_kind=KIND_N4A_PY_BUNDLE, note=_OPAQUE_NOTE)
         )
@@ -254,7 +265,7 @@ def _detect_directory(root: Path, result: DetectionResult) -> None:
     native = _detect_native_dir(root, ".")
     if native is not None:
         result.artifacts.append(native)
-    for child in sorted(p for p in root.iterdir() if p.is_dir()):
+    for child in (path for path in children if path.is_dir()):
         native_child = _detect_native_dir(child, child.name)
         if native_child is not None:
             result.artifacts.append(native_child)
@@ -279,16 +290,16 @@ def detect_sources(input_path: Path) -> DetectionResult:
 
     if root.is_file():
         name = root.name
-        if name.endswith(".n4a.py"):
+        if _is_n4a_py_bundle_name(name):
             result.artifacts.append(DetectedArtifact(path=".", source_kind=KIND_N4A_PY_BUNDLE, note=_OPAQUE_NOTE))
-        elif name.endswith(".n4a"):
+        elif is_n4a_bundle_name(name):
             result.artifacts.append(_detect_n4a_bundle(root, "."))
         else:
             result.artifacts.append(_unknown("unrecognized file"))
         return result
 
     if not root.is_dir():
-        if root.name.endswith(".n4a"):
+        if is_n4a_bundle_name(root.name):
             result.artifacts.append(_detect_n4a_bundle(root, "."))
         else:
             result.artifacts.append(_unknown("path is neither a regular file nor a directory"))
@@ -313,5 +324,6 @@ __all__ = [
     "KIND_UNKNOWN",
     "DetectedArtifact",
     "DetectionResult",
+    "is_n4a_bundle_name",
     "detect_sources",
 ]

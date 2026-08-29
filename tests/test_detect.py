@@ -54,6 +54,22 @@ def test_detect_n4a_bundle_file(n4a_bundle: Path) -> None:
     assert art.details["archive_preflight"]["validated_content_sha256"].startswith("sha256:")
 
 
+@pytest.mark.parametrize("direct", [True, False])
+def test_detect_uppercase_n4a_bundle_file_and_directory_entry(tmp_path: Path, direct: bool) -> None:
+    if direct:
+        source = make_n4a_bundle(tmp_path / "MODEL.N4A", bundle_format_version="1.0")
+        result = detect.detect_sources(source)
+    else:
+        root = tmp_path / "source"
+        root.mkdir()
+        make_n4a_bundle(root / "MODEL.N4A", bundle_format_version="1.0")
+        result = detect.detect_sources(root)
+
+    art = next(artifact for artifact in result.artifacts if artifact.source_kind == detect.KIND_N4A_BUNDLE)
+    assert art.path == ("." if direct else "MODEL.N4A")
+    assert art.supported is True
+
+
 def test_detect_forward_n4a_bundle(tmp_path: Path) -> None:
     bundle = make_n4a_bundle(tmp_path / "future.n4a", bundle_format_version="2.0")
     result = detect.detect_sources(bundle)
