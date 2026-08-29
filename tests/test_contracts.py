@@ -47,6 +47,7 @@ def test_build_manifest_skeleton() -> None:
         "tool",
         "source",
         "target",
+        "migration",
         "input_inventory",
         "output_inventory",
         "checksums",
@@ -59,6 +60,11 @@ def test_build_manifest_skeleton() -> None:
         assert key in manifest
     assert manifest["tool"]["support_window"] == "window"
     assert manifest["target"]["kind"] == "nirs4all-workspace-v2"
+    assert manifest["migration"] == {
+        "mode": None,
+        "terminal_status": None,
+        "terminal_exit_code": None,
+    }
 
 
 def test_build_report_skeleton() -> None:

@@ -17,8 +17,9 @@ import re
 import shutil
 import sqlite3
 import unicodedata
+from collections import Counter
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from . import contracts, vocab
@@ -72,6 +73,7 @@ from .policy import (
     assert_output_available,
     assert_path_outside_source,
     read_only_sqlite_uri,
+    realpath,
     snapshot_tree,
     source_guard,
 )
@@ -119,6 +121,9 @@ _WINDOWS_RESERVED_ARRAY_STEMS = frozenset(
 )
 _ARRAY_SIDECAR_SUFFIX = ".parquet"
 _PORTABLE_ARRAY_FILENAME_MAX_BYTES = 255
+_RESUME_MODE_BEST_EFFORT = "best-effort"
+_RESUME_MODE_COPY_ONLY = "copy-only"
+_RESUME_MODE_STRICT = "strict"
 _RUNTIME_ARRAY_RECORD_FIELDS = (
     "prediction_id",
     "dataset_name",
@@ -170,14 +175,34 @@ def _write_unsupported_report(
     document = contracts.build_unsupported_report(
         manifest=manifest,
         report=report,
-        target_path=str(target_path),
+        target_path=str(realpath(target_path)),
     )
     _write_json(path, document)
 
 
-def _contract_exclude_names(*paths: Path | None) -> set[str]:
-    """Return contract filenames that verification should not treat as orphans."""
-    return {p.name for p in paths if p is not None}
+def _contract_exclude_paths(output_dir: Path, *paths: Path | None) -> set[str]:
+    """Return safe, exact configured-contract paths below ``output_dir``.
+
+    Verification accepts custom nested contract paths for fresh migrations,
+    but an exclusion must never be widened to a basename that could hide a
+    same-named payload elsewhere in the output tree.
+    """
+    output_root = realpath(output_dir)
+    excluded: set[str] = set()
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            resolved = realpath(path)
+        except (OSError, ValueError):
+            continue
+        if resolved == output_root or output_root not in resolved.parents:
+            continue
+        relative = resolved.relative_to(output_root).as_posix()
+        target, _reason = _safe_output_member_path(output_root, relative)
+        if target == resolved:
+            excluded.add(relative)
+    return excluded
 
 
 def _source_fingerprint(source: Path) -> str:
@@ -202,6 +227,33 @@ def _source_fingerprint_from_snapshot(snapshot: TreeSnapshot) -> str:
             entries.append({"kind": "file", "path": rel, "sha256": digest, "size": size})
     payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return sha256_bytes(payload)
+
+
+def _assert_copy_only_source_paths_are_portable(snapshot: TreeSnapshot) -> None:
+    """Refuse source names that cannot enter the portable output checksum ledger.
+
+    Output ledger paths are canonical slash-separated names.  On POSIX a
+    literal backslash is legal in a source filename but cannot be represented
+    without making the resulting manifest unverifiable, so reject it before
+    any output is created rather than weakening the untrusted-ledger parser.
+    ``Path.parts`` distinguishes that POSIX literal from a native Windows path
+    separator.
+    """
+    root = Path(snapshot.root)
+    if root.is_file():
+        candidates = [root.name]
+    else:
+        candidates = [relative for relative, (size, _mtime, _digest) in snapshot.entries.items() if size >= 0]
+    nonportable = sorted(
+        candidate for candidate in candidates if any("\\" in component for component in Path(candidate).parts)
+    )
+    if nonportable:
+        examples = ", ".join(ascii(path) for path in nonportable[:3])
+        raise UnsupportedInput(
+            f"--copy-only cannot attest source entry names containing a literal backslash ({examples})",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="rename the source entry to a portable name before migration",
+        )
 
 
 def _assert_source_fingerprint_matches(source: Path, expected: str) -> None:
@@ -351,6 +403,7 @@ def inspect(input_path: Path, *, fmt: str = "json", report_path: Path | None = N
     inspection document only to an explicit ``--report`` path that resolves
     outside the source tree.
     """
+    input_path = realpath(input_path)
     if report_path is not None:
         assert_path_outside_source(input_path, report_path)
 
@@ -401,6 +454,502 @@ def _resolve_contract_paths(
     id_map = id_map_path or (output / contracts.DEFAULT_ID_MAP_NAME)
     unsupported = unsupported_report_path or (output / contracts.DEFAULT_UNSUPPORTED_REPORT_NAME)
     return manifest, report, id_map, unsupported
+
+
+def _require_default_internal_contract_paths(
+    output: Path,
+    *,
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    unsupported_report_path: Path | None,
+) -> None:
+    """Keep real migration contracts either default-internal or external.
+
+    Standalone ``legacy verify`` knows only the supplied manifest and the four
+    default root contract names.  Letting an arbitrary nested contract live in
+    the output would make it indistinguishable from an orphaned payload later,
+    so custom locations must resolve outside the output tree.
+    """
+    output_dir = realpath(output)
+    contract_paths = (
+        ("migration manifest", manifest_path, contracts.DEFAULT_MANIFEST_NAME),
+        ("migration report", report_path, contracts.DEFAULT_REPORT_NAME),
+        ("migration id-map", id_map_path, contracts.DEFAULT_ID_MAP_NAME),
+        ("unsupported-item report", unsupported_report_path, contracts.DEFAULT_UNSUPPORTED_REPORT_NAME),
+    )
+    for label, configured_path, filename in contract_paths:
+        if configured_path is None:
+            continue
+        resolved = realpath(configured_path)
+        if resolved == output_dir or output_dir not in resolved.parents:
+            continue
+        if resolved != output_dir / filename:
+            raise UnsupportedInput(
+                f"the {label} path inside --output must be the default {filename!r} contract",
+                cause=vocab.CAUSE_INVALID_REQUEST,
+                mitigation="use the default in-output contract path or place a custom contract outside --output",
+            )
+
+
+def _migration_mode(*, strict: bool, copy_only: bool) -> str:
+    """Return the durable invocation mode used to attest a completed output."""
+    if copy_only:
+        return _RESUME_MODE_COPY_ONLY
+    return _RESUME_MODE_STRICT if strict else _RESUME_MODE_BEST_EFFORT
+
+
+def _terminal_exit_code_for_status(status: object) -> ExitCode | None:
+    """Return the only documented terminal code for a migration status."""
+    if status == vocab.STATUS_SUCCESS:
+        return ExitCode.SUCCESS
+    if status == vocab.STATUS_MIGRATED_WITH_WARNINGS:
+        return ExitCode.MIGRATED_WITH_WARNINGS
+    return None
+
+
+def _attest_terminal_outcome(manifest: dict[str, Any], report: dict[str, Any]) -> ExitCode:
+    """Bind a completed runner's terminal status and code into its manifest."""
+    status = report.get("status")
+    exit_code = _terminal_exit_code_for_status(status)
+    migration = manifest.get("migration")
+    if exit_code is None or not isinstance(status, str) or not isinstance(migration, dict):
+        raise RuntimeError("completed migration has no attestable terminal outcome")
+    migration["terminal_status"] = status
+    migration["terminal_exit_code"] = int(exit_code)
+    return exit_code
+
+
+def _resume_refusal(detail: str) -> UnsupportedInput:
+    """Build the single fail-closed error shape for unattested resume state."""
+    return UnsupportedInput(
+        f"--resume requires one complete, internally attested output: {detail}",
+        cause=vocab.CAUSE_INVALID_REQUEST,
+        mitigation=(
+            "use a fresh empty --output for a new migration; run 'nirs4all-tools legacy verify' "
+            "to inspect an existing output"
+        ),
+    )
+
+
+def _resume_internal_contract_path(
+    output_dir: Path,
+    configured_path: Path | None,
+    *,
+    filename: str,
+    label: str,
+) -> Path:
+    """Require one resume contract to be the non-symlinked default output child."""
+    expected = output_dir / filename
+    if configured_path is None:
+        raise _resume_refusal(f"the internal {label} path is missing")
+    try:
+        configured_real = realpath(configured_path)
+    except (OSError, ValueError) as exc:
+        raise _resume_refusal(f"the configured {label} path is invalid") from exc
+    if configured_real != expected:
+        raise _resume_refusal(f"the {label} must be the internal {filename!r} contract")
+    return expected
+
+
+def _read_resume_document(path: Path, *, label: str) -> dict[str, Any]:
+    """Read one persisted contract, mapping malformed state to ``UnsupportedInput``."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise _resume_refusal(f"cannot read the internal {label}") from exc
+    if not isinstance(document, dict):
+        raise _resume_refusal(f"the internal {label} is not a JSON object")
+    return document
+
+
+def _require_resume_schema(document: dict[str, Any], *, schema_id: str, schema_version: int, label: str) -> None:
+    """Validate the durable identity of one persisted contract document."""
+    if document.get("$id") != schema_id or type(document.get("schema_version")) is not int:
+        raise _resume_refusal(f"the internal {label} has an unsupported schema")
+    if document["schema_version"] != schema_version:
+        raise _resume_refusal(f"the internal {label} has an unsupported schema")
+
+
+def _id_map_shape_errors(document: object) -> list[str]:
+    """Return structural errors for the durable public entity map."""
+    if not isinstance(document, dict):
+        return ["id-map is not an object"]
+    if (
+        document.get("$id") != contracts.ID_MAP_SCHEMA_ID
+        or type(document.get("schema_version")) is not int
+        or document["schema_version"] != contracts.ID_MAP_SCHEMA_VERSION
+    ):
+        return ["id-map schema identity is invalid"]
+    entities = document.get("entities")
+    if not isinstance(entities, dict) or set(entities) != set(contracts.ID_MAP_ENTITIES):
+        return ["id-map entity set is incomplete"]
+    if any(not isinstance(entries, list) for entries in entities.values()):
+        return ["id-map entity entries are invalid"]
+    return []
+
+
+def _require_resume_id_map_shape(document: object, *, label: str) -> None:
+    """Require the complete public entity map shape, not just a schema header."""
+    if _id_map_shape_errors(document):
+        raise _resume_refusal(f"the {label} entity set is incomplete")
+
+
+def _manifest_contract_shape_errors(manifest: object) -> list[str]:
+    """Return manifest-shape faults shared by direct verify and resume."""
+    if not isinstance(manifest, dict):
+        return ["manifest is not a JSON object"]
+    errors: list[str] = []
+    if (
+        manifest.get("$id") != contracts.MANIFEST_SCHEMA_ID
+        or type(manifest.get("schema_version")) is not int
+        or manifest["schema_version"] != contracts.MANIFEST_SCHEMA_VERSION
+    ):
+        errors.append("manifest schema identity is invalid")
+    for field in ("tool", "source", "target"):
+        if not isinstance(manifest.get(field), dict):
+            errors.append(f"manifest {field} is invalid")
+    for field in ("input_inventory", "output_inventory", "preserved_opaque", "unsupported", "warnings"):
+        if not isinstance(manifest.get(field), list):
+            errors.append(f"manifest {field} is invalid")
+    if not isinstance(manifest.get("checksums"), dict):
+        errors.append("manifest checksums are invalid")
+    errors.extend(_id_map_shape_errors(manifest.get("old_to_new_ids")))
+    return errors
+
+
+def _require_resume_inventory_shape(inventory: object, *, label: str, input_inventory: bool) -> None:
+    """Require inventory entries to keep their durable list/object boundary."""
+    if not isinstance(inventory, list) or not inventory:
+        raise _resume_refusal(f"the manifest {label} is incomplete")
+    for index, item in enumerate(inventory):
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"]:
+            raise _resume_refusal(f"the manifest {label}[{index}] is invalid")
+        if not isinstance(item.get("tables"), dict) or not isinstance(item.get("row_counts"), dict):
+            raise _resume_refusal(f"the manifest {label}[{index}] is invalid")
+        if input_inventory:
+            if (
+                not isinstance(item.get("source_kind"), str)
+                or not isinstance(item.get("discovered_manifests"), list)
+                or not isinstance(item.get("discovered_bundles"), list)
+                or not isinstance(item.get("preserved_opaque"), bool)
+                or not isinstance(item.get("supported"), bool)
+                or not isinstance(item.get("forward_version"), bool)
+                or item.get("note") is not None
+                and not isinstance(item.get("note"), str)
+            ):
+                raise _resume_refusal(f"the manifest {label}[{index}] is invalid")
+        elif not isinstance(item.get("generated_manifests"), list):
+            raise _resume_refusal(f"the manifest {label}[{index}] is invalid")
+
+
+def _require_resume_manifest_shape(manifest: dict[str, Any]) -> None:
+    """Validate required completed-manifest sections before using their values."""
+    tool = manifest.get("tool")
+    source = manifest.get("source")
+    target = manifest.get("target")
+    migration = manifest.get("migration")
+    checksums = manifest.get("checksums")
+    if not isinstance(tool, dict) or not isinstance(source, dict) or not isinstance(target, dict):
+        raise _resume_refusal("the manifest required sections are incomplete")
+    if (
+        not isinstance(migration, dict)
+        or not isinstance(checksums, dict)
+        or not isinstance(manifest.get("environment"), dict)
+    ):
+        raise _resume_refusal("the manifest required sections are incomplete")
+    if (
+        not isinstance(tool.get("name"), str)
+        or not isinstance(tool.get("version"), str)
+        or not isinstance(tool.get("support_window"), str)
+        or not isinstance(tool.get("created_at"), str)
+        or not isinstance(source.get("path"), str)
+        or not isinstance(source.get("fingerprint"), str)
+        or not isinstance(source.get("kinds"), list)
+        or not isinstance(source.get("detected_versions"), dict)
+        or not isinstance(target.get("kind"), str)
+        or type(target.get("schema_version")) is not int
+        or not isinstance(migration.get("mode"), str)
+    ):
+        raise _resume_refusal("the manifest required fields are invalid")
+    if any(not isinstance(path, str) or not isinstance(digest, str) for path, digest in checksums.items()):
+        raise _resume_refusal("the manifest checksum ledger is invalid")
+    for field in ("preserved_opaque", "unsupported", "warnings"):
+        if not isinstance(manifest.get(field), list):
+            raise _resume_refusal(f"the manifest {field} section is invalid")
+    _require_resume_inventory_shape(manifest.get("input_inventory"), label="input inventory", input_inventory=True)
+    _require_resume_inventory_shape(manifest.get("output_inventory"), label="output inventory", input_inventory=False)
+    embedded_id_map = manifest.get("old_to_new_ids")
+    if not isinstance(embedded_id_map, dict):
+        raise _resume_refusal("the manifest id-map is invalid")
+    _require_resume_schema(
+        embedded_id_map,
+        schema_id=contracts.ID_MAP_SCHEMA_ID,
+        schema_version=contracts.ID_MAP_SCHEMA_VERSION,
+        label="manifest id-map",
+    )
+    _require_resume_id_map_shape(embedded_id_map, label="manifest id-map")
+
+
+def _require_resume_report_shape(report: dict[str, Any]) -> None:
+    """Require the report sections that bind a terminal migration result."""
+    if not isinstance(report.get("status"), str):
+        raise _resume_refusal("the internal migration report status is invalid")
+    for field in ("source_summary", "target_summary", "migrated_counts", "preserved_counts", "unsupported_counts"):
+        if not isinstance(report.get(field), dict):
+            raise _resume_refusal(f"the internal migration report {field} is invalid")
+    if not isinstance(report.get("verification_summary"), dict):
+        raise _resume_refusal("the internal migration report verification summary is invalid")
+    if not isinstance(report.get("errors"), list) or not isinstance(report.get("warnings"), list):
+        raise _resume_refusal("the internal migration report lists are invalid")
+    if not isinstance(report.get("recommended_next_command"), str):
+        raise _resume_refusal("the internal migration report next command is invalid")
+
+
+def _unsupported_report_count_errors(document: dict[str, Any]) -> list[str]:
+    """Return count-ledger inconsistencies in an unsupported-item report."""
+    entries = document.get("unsupported")
+    preserved_opaque = document.get("preserved_opaque")
+    counts = document.get("counts")
+    if not isinstance(entries, list) or not isinstance(preserved_opaque, list) or not isinstance(counts, dict):
+        return ["unsupported-item report count sections are invalid"]
+
+    preserved = 0
+    refused = 0
+    for item in entries:
+        if not isinstance(item, dict):
+            return ["unsupported-item report entries are invalid"]
+        disposition = item.get("disposition")
+        if disposition in {"preserved", "would_preserve"}:
+            preserved += 1
+        elif disposition == "refused":
+            refused += 1
+        else:
+            return ["unsupported-item report disposition is invalid"]
+
+    expected = {
+        "unsupported": len(entries),
+        "preserved": preserved,
+        "refused": refused,
+        "opaque_payloads": len(preserved_opaque),
+    }
+    errors: list[str] = []
+    for name, value in expected.items():
+        if type(counts.get(name)) is not int or counts[name] != value:
+            errors.append(f"unsupported-item report count {name!r} is inconsistent")
+    return errors
+
+
+def _require_resume_unsupported_shape(unsupported: dict[str, Any]) -> None:
+    """Require the unsupported-item report sections used for resume binding."""
+    if not isinstance(unsupported.get("generated_at"), str) or not isinstance(unsupported.get("status"), str):
+        raise _resume_refusal("the internal unsupported-item report status is invalid")
+    for field in ("source", "target", "counts"):
+        if not isinstance(unsupported.get(field), dict):
+            raise _resume_refusal(f"the internal unsupported-item report {field} is invalid")
+    for field in ("unsupported", "preserved_opaque", "warnings"):
+        if not isinstance(unsupported.get(field), list):
+            raise _resume_refusal(f"the internal unsupported-item report {field} is invalid")
+    if not isinstance(unsupported.get("recommended_next_command"), str):
+        raise _resume_refusal("the internal unsupported-item report next command is invalid")
+    if _unsupported_report_count_errors(unsupported):
+        raise _resume_refusal("the internal unsupported-item report counts do not match its ledger")
+
+
+def _resume_realpath(value: object) -> Path | None:
+    """Return a normalized persisted path, refusing non-path-like values safely."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return realpath(Path(value))
+    except (OSError, ValueError):
+        return None
+
+
+def _resume_terminal_outcome(migration: dict[str, Any]) -> tuple[str, ExitCode]:
+    """Return the manifest-attested terminal outcome or refuse stale state."""
+    status = migration.get("terminal_status")
+    exit_code = _terminal_exit_code_for_status(status)
+    stored_code = migration.get("terminal_exit_code")
+    if (
+        exit_code is None
+        or not isinstance(status, str)
+        or type(stored_code) is not int
+        or stored_code != int(exit_code)
+    ):
+        raise _resume_refusal("the manifest terminal outcome is missing or invalid")
+    return status, exit_code
+
+
+def _resume_completed_migration(
+    input_path: Path,
+    output: Path,
+    *,
+    target: str,
+    source_fingerprint: str,
+    strict: bool,
+    copy_only: bool,
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    unsupported_report_path: Path | None,
+) -> ExitCode:
+    """Validate a completed migration and return its terminal code without writing.
+
+    ``--resume`` deliberately has no checkpoint/recovery semantics.  It is an
+    idempotent, read-only acknowledgement of a complete output whose internal
+    contracts, source binding, invocation mode, and generated payloads still
+    verify exactly.
+    """
+    try:
+        output_dir = realpath(output)
+    except (OSError, ValueError) as exc:
+        raise _resume_refusal("the output path is invalid") from exc
+    if not output_dir.is_dir():
+        raise _resume_refusal("the output directory does not exist")
+
+    manifest_file = _resume_internal_contract_path(
+        output_dir,
+        manifest_path,
+        filename=contracts.DEFAULT_MANIFEST_NAME,
+        label="migration manifest",
+    )
+    report_file = _resume_internal_contract_path(
+        output_dir,
+        report_path,
+        filename=contracts.DEFAULT_REPORT_NAME,
+        label="migration report",
+    )
+    id_map_file = _resume_internal_contract_path(
+        output_dir,
+        id_map_path,
+        filename=contracts.DEFAULT_ID_MAP_NAME,
+        label="migration id-map",
+    )
+    unsupported_file = _resume_internal_contract_path(
+        output_dir,
+        unsupported_report_path,
+        filename=contracts.DEFAULT_UNSUPPORTED_REPORT_NAME,
+        label="unsupported-item report",
+    )
+
+    manifest = _read_resume_document(manifest_file, label="migration manifest")
+    report = _read_resume_document(report_file, label="migration report")
+    id_map = _read_resume_document(id_map_file, label="migration id-map")
+    unsupported = _read_resume_document(unsupported_file, label="unsupported-item report")
+
+    _require_resume_schema(
+        manifest,
+        schema_id=contracts.MANIFEST_SCHEMA_ID,
+        schema_version=contracts.MANIFEST_SCHEMA_VERSION,
+        label="migration manifest",
+    )
+    _require_resume_schema(
+        report,
+        schema_id=contracts.REPORT_SCHEMA_ID,
+        schema_version=contracts.REPORT_SCHEMA_VERSION,
+        label="migration report",
+    )
+    _require_resume_schema(
+        id_map,
+        schema_id=contracts.ID_MAP_SCHEMA_ID,
+        schema_version=contracts.ID_MAP_SCHEMA_VERSION,
+        label="migration id-map",
+    )
+    _require_resume_schema(
+        unsupported,
+        schema_id=contracts.UNSUPPORTED_REPORT_SCHEMA_ID,
+        schema_version=contracts.UNSUPPORTED_REPORT_SCHEMA_VERSION,
+        label="unsupported-item report",
+    )
+    _require_resume_manifest_shape(manifest)
+    _require_resume_report_shape(report)
+    _require_resume_id_map_shape(id_map, label="migration id-map")
+    _require_resume_unsupported_shape(unsupported)
+
+    expected_target = _RESUME_MODE_COPY_ONLY if copy_only else target
+    expected_mode = _migration_mode(strict=strict, copy_only=copy_only)
+    target_document = manifest.get("target")
+    source_document = manifest.get("source")
+    tool_document = manifest.get("tool")
+    migration_document = manifest.get("migration")
+    if not isinstance(target_document, dict) or target_document.get("kind") != expected_target:
+        raise _resume_refusal("the manifest target does not match this invocation")
+    if target_document.get("schema_version") != contracts.WORKSPACE_V2_USER_VERSION:
+        raise _resume_refusal("the manifest target schema does not match this invocation")
+    if not isinstance(source_document, dict):
+        raise _resume_refusal("the manifest source binding is missing")
+    if _resume_realpath(source_document.get("path")) != realpath(input_path):
+        raise _resume_refusal("the manifest source path does not match this invocation")
+    if source_document.get("fingerprint") != source_fingerprint:
+        raise _resume_refusal("the manifest source fingerprint does not match this invocation")
+    if not isinstance(migration_document, dict) or migration_document.get("mode") != expected_mode:
+        raise _resume_refusal("the manifest migration mode does not match this invocation")
+    terminal_status, exit_code = _resume_terminal_outcome(migration_document)
+    input_inventory = manifest.get("input_inventory")
+    output_inventory = manifest.get("output_inventory")
+    checksums = manifest.get("checksums")
+    if not isinstance(input_inventory, list) or not input_inventory:
+        raise _resume_refusal("the manifest input inventory is incomplete")
+    if not isinstance(output_inventory, list) or not output_inventory:
+        raise _resume_refusal("the manifest output inventory is incomplete")
+    if not isinstance(checksums, dict) or not checksums:
+        raise _resume_refusal("the manifest checksum ledger is incomplete")
+    file_checksums = {
+        path: digest for path, digest in checksums.items() if isinstance(path, str) and not path.startswith("arrays:")
+    }
+    if not file_checksums or any(
+        not isinstance(path, str) or not path or not isinstance(digest, str) or not digest.startswith("sha256:")
+        for path, digest in file_checksums.items()
+    ):
+        raise _resume_refusal("the manifest checksum ledger is invalid")
+    if not isinstance(tool_document, dict) or tool_document.get("name") != "nirs4all-tools":
+        raise _resume_refusal("the manifest tool attestation is invalid")
+    completed_at = tool_document.get("completed_at")
+    if not isinstance(completed_at, str) or not completed_at:
+        raise _resume_refusal("the manifest does not attest a completed migration")
+    try:
+        completed_time = datetime.fromisoformat(completed_at)
+    except ValueError as exc:
+        raise _resume_refusal("the manifest completion time is invalid") from exc
+    if completed_time.tzinfo is None:
+        raise _resume_refusal("the manifest completion time is not timezone-aware")
+
+    report_target = report.get("target_summary")
+    if not isinstance(report_target, dict) or report_target.get("kind") != expected_target:
+        raise _resume_refusal("the migration report target does not match the manifest")
+    if _resume_realpath(report_target.get("path")) != output_dir:
+        raise _resume_refusal("the migration report output path does not match this invocation")
+    if report.get("status") != terminal_status:
+        raise _resume_refusal("the migration report terminal status does not match the manifest")
+
+    if id_map != manifest.get("old_to_new_ids"):
+        raise _resume_refusal("the migration id-map does not match the manifest")
+    unsupported_target = unsupported.get("target")
+    if not isinstance(unsupported_target, dict) or unsupported_target.get("kind") != expected_target:
+        raise _resume_refusal("the unsupported-item report target does not match the manifest")
+    if _resume_realpath(unsupported_target.get("path")) != output_dir:
+        raise _resume_refusal("the unsupported-item report output path does not match this invocation")
+    if unsupported.get("status") != terminal_status:
+        raise _resume_refusal("the unsupported-item report terminal status does not match the manifest")
+    if unsupported.get("source") != source_document:
+        raise _resume_refusal("the unsupported-item report source does not match the manifest")
+    if unsupported.get("unsupported") != manifest.get("unsupported"):
+        raise _resume_refusal("the unsupported-item report entries do not match the manifest")
+    if unsupported.get("preserved_opaque") != manifest.get("preserved_opaque"):
+        raise _resume_refusal("the unsupported-item report payload ledger does not match the manifest")
+
+    try:
+        summary = _verification_summary_from_manifest(
+            output_dir,
+            manifest,
+            _contract_exclude_paths(output_dir, manifest_file, report_file, id_map_file, unsupported_file),
+        )
+    except Exception as exc:  # noqa: BLE001 - persisted contracts are untrusted resume input.
+        raise _resume_refusal("the manifest cannot be verified") from exc
+    if not summary["passed"]:
+        raise _resume_refusal(f"the existing output failed verification ({summary['mismatches']} mismatch(es))")
+    return exit_code
 
 
 def _copy_only(
@@ -744,8 +1293,7 @@ def _runtime_array_sidecar_unavailable() -> UnsupportedInput:
         "runtime Parquet array sidecar lowering requires the optional pyarrow dependency",
         cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
         mitigation=(
-            'install nirs4all-tools with the "parquet" extra, '
-            "or rerun without --strict for opaque preservation"
+            'install nirs4all-tools with the "parquet" extra, or rerun without --strict for opaque preservation'
         ),
     )
 
@@ -923,7 +1471,7 @@ def _refuse_unsupported_detected_n4a_archives(detection: DetectionResult) -> Non
 
 def _artifact_preserved_rel(input_path: Path, art: DetectedArtifact) -> str:
     """Stable destination under ``preserved/`` for one opaque artifact."""
-    name = (input_path.name or "root") if art.path == "." else art.path
+    name = (realpath(input_path).name or "root") if art.path == "." else art.path
     return f"{_PRESERVED_DIRNAME}/{art.source_kind}/{name}"
 
 
@@ -1106,8 +1654,7 @@ def _dry_run_unsupported_items(input_path: Path, detection: DetectionResult) -> 
                 _unsupported_entry(
                     art,
                     reason=(
-                        "source declares a version newer than this tool supports: "
-                        f"{art.path}({art.detected_version})"
+                        f"source declares a version newer than this tool supports: {art.path}({art.detected_version})"
                     ),
                     disposition="refused",
                     cause=vocab.CAUSE_FORWARD_VERSION,
@@ -1243,6 +1790,7 @@ def migrate(
 
     Non-lowerable recognized artifacts are preserved opaque in best-effort
     mode; strict mode requires semantic lowering and refuses before writing.
+    ``--resume`` is only a verified, read-only no-op for a completed output.
     """
     # --- Pre-flight: target + path policy (no writes yet) ------------------
     if target == vocab.TARGET_NATIVE_RESULTS_V1:
@@ -1275,7 +1823,17 @@ def migrate(
             cause=vocab.CAUSE_INVALID_REQUEST,
             mitigation="omit --strict for dry-run/copy-only, or wait for the schema-transform engine",
         )
+    if resume and dry_run:
+        raise UnsupportedInput(
+            "--resume is only available for an already completed output, not --dry-run",
+            cause=vocab.CAUSE_INVALID_REQUEST,
+            mitigation="omit --resume for a dry-run, or use --resume alone to attest an existing output",
+        )
 
+    # Resolve a user-supplied source symlink once at the command boundary.
+    # N4A descriptors remain opened with O_NOFOLLOW below, now against that
+    # stable target path rather than the user-facing symlink itself.
+    input_path = realpath(input_path)
     assert_disjoint(input_path, output)
     manifest_path, report_path, id_map_path, unsupported_report_path = _resolve_contract_paths(
         output=output,
@@ -1288,6 +1846,14 @@ def migrate(
     for explicit in (manifest_path, report_path, id_map_path, unsupported_report_path):
         if explicit is not None:
             assert_path_outside_source(input_path, explicit)
+    if not dry_run:
+        _require_default_internal_contract_paths(
+            output,
+            manifest_path=manifest_path,
+            report_path=report_path,
+            id_map_path=id_map_path,
+            unsupported_report_path=unsupported_report_path,
+        )
 
     # --- Detection + forward-version refusal (still no writes) -------------
     with source_guard(input_path):
@@ -1311,24 +1877,42 @@ def migrate(
 
     if not dry_run:
         _refuse_unsupported_detected_n4a_archives(detection)
-        assert_output_available(output, resume=resume)
+        if copy_only and not resume:
+            _assert_copy_only_source_paths_are_portable(initial_snapshot)
+        if resume:
+            with source_guard(input_path):
+                _assert_source_fingerprint_matches(input_path, source_fingerprint)
+                return _resume_completed_migration(
+                    input_path,
+                    output,
+                    target=target,
+                    source_fingerprint=source_fingerprint,
+                    strict=strict,
+                    copy_only=copy_only,
+                    manifest_path=manifest_path,
+                    report_path=report_path,
+                    id_map_path=id_map_path,
+                    unsupported_report_path=unsupported_report_path,
+                )
+        assert_output_available(output, resume=False)
 
     # --- Build contract skeletons -----------------------------------------
     manifest = contracts.build_manifest(
         tool_version=tool_version,
         support_window=SUPPORT_WINDOW,
-        source_path=str(input_path),
+        source_path=str(realpath(input_path)),
         source_fingerprint=source_fingerprint,
         source_kinds=detection.kinds,
         detected_versions=detection.detected_versions,
         target_kind=target,
         target_schema_version=contracts.WORKSPACE_V2_USER_VERSION,
     )
+    manifest["migration"]["mode"] = _migration_mode(strict=strict, copy_only=copy_only)
     manifest["input_inventory"] = [_inventory_entry(a) for a in detection.artifacts]
     report = contracts.build_report(
         status=vocab.STATUS_SUCCESS,
         target_kind=target,
-        target_path=str(output),
+        target_path=str(realpath(output)),
         source_kinds=detection.kinds,
     )
 
@@ -1364,7 +1948,8 @@ def migrate(
             )
         if any(art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS for art in detection.artifacts):
             extra_opaque_artifacts = [
-                art for art in _preservable_opaque_artifacts(detection)
+                art
+                for art in _preservable_opaque_artifacts(detection)
                 if art.source_kind != KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS
             ]
             if strict and extra_opaque_artifacts:
@@ -1699,6 +2284,7 @@ def _run_copy_only(
         report["status"] = vocab.STATUS_SUCCESS
         report["target_summary"]["kind"] = "copy-only"
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+        _attest_terminal_outcome(manifest, report)
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
         _write_unsupported_report(
@@ -1708,8 +2294,10 @@ def _run_copy_only(
             target_path=output,
         )
         if verify_after:
-            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
-            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            exclude_paths = _contract_exclude_paths(
+                output, manifest_path, report_path, id_map_path, unsupported_report_path
+            )
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_paths)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
             _write_json(report_path, report)
@@ -1864,6 +2452,7 @@ def _run_sqlite_legacy_arrays_transform(
             else:
                 report["status"] = vocab.STATUS_SUCCESS
             report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+            _attest_terminal_outcome(manifest, report)
 
             if manifest_path is not None:
                 _write_json(manifest_path, manifest)
@@ -1874,13 +2463,14 @@ def _run_sqlite_legacy_arrays_transform(
                 target_path=output,
             )
             if verify_after:
-                exclude_names = _contract_exclude_names(
+                exclude_paths = _contract_exclude_paths(
+                    output,
                     manifest_path,
                     report_path,
                     id_map_path,
                     unsupported_report_path,
                 )
-                report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+                report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_paths)
                 _raise_if_verification_failed(report["verification_summary"])
             if report_path is not None:
                 _write_json(report_path, report)
@@ -1972,6 +2562,7 @@ def _run_duckdb_workspace_preview_transform(
         )
         report["preserved_counts"]["duckdb_source_payloads"] = 1
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+        _attest_terminal_outcome(manifest, report)
 
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
@@ -1982,8 +2573,10 @@ def _run_duckdb_workspace_preview_transform(
             target_path=output,
         )
         if verify_after:
-            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
-            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            exclude_paths = _contract_exclude_paths(
+                output, manifest_path, report_path, id_map_path, unsupported_report_path
+            )
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_paths)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
             _write_json(report_path, report)
@@ -2072,6 +2665,7 @@ def _run_native_results_preview_transform(
         )
         report["preserved_counts"]["native_payloads"] = 1
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+        _attest_terminal_outcome(manifest, report)
 
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
@@ -2082,8 +2676,10 @@ def _run_native_results_preview_transform(
             target_path=output,
         )
         if verify_after:
-            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
-            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            exclude_paths = _contract_exclude_paths(
+                output, manifest_path, report_path, id_map_path, unsupported_report_path
+            )
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_paths)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
             _write_json(report_path, report)
@@ -2206,6 +2802,7 @@ def _run_legacy_runs_preview_transform(
         )
         report["preserved_counts"]["legacy_run_payloads"] = 1
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+        _attest_terminal_outcome(manifest, report)
 
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
@@ -2216,8 +2813,10 @@ def _run_legacy_runs_preview_transform(
             target_path=output,
         )
         if verify_after:
-            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
-            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            exclude_paths = _contract_exclude_paths(
+                output, manifest_path, report_path, id_map_path, unsupported_report_path
+            )
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_paths)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
             _write_json(report_path, report)
@@ -2301,6 +2900,7 @@ def _run_loose_predictions_preview_transform(
         )
         report["preserved_counts"]["loose_prediction_payloads"] = 1
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+        _attest_terminal_outcome(manifest, report)
 
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
@@ -2311,8 +2911,10 @@ def _run_loose_predictions_preview_transform(
             target_path=output,
         )
         if verify_after:
-            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
-            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            exclude_paths = _contract_exclude_paths(
+                output, manifest_path, report_path, id_map_path, unsupported_report_path
+            )
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_paths)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
             _write_json(report_path, report)
@@ -2400,6 +3002,7 @@ def _run_opaque_artifact_preservation(
             "opaque legacy artifacts preserved; rerun a future tool release for semantic lowering"
         )
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
+        _attest_terminal_outcome(manifest, report)
 
         if manifest_path is not None:
             _write_json(manifest_path, manifest)
@@ -2410,8 +3013,10 @@ def _run_opaque_artifact_preservation(
             target_path=output,
         )
         if verify_after:
-            exclude_names = _contract_exclude_names(manifest_path, report_path, id_map_path, unsupported_report_path)
-            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_names)
+            exclude_paths = _contract_exclude_paths(
+                output, manifest_path, report_path, id_map_path, unsupported_report_path
+            )
+            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_paths)
             _raise_if_verification_failed(report["verification_summary"])
         if report_path is not None:
             _write_json(report_path, report)
@@ -2424,13 +3029,145 @@ def _run_opaque_artifact_preservation(
         raise
 
 
-def _iter_output_files(output_dir: Path, exclude: set[str]) -> list[str]:
-    """Relative paths of every file under ``output_dir`` except ``exclude`` names."""
+def _safe_output_member_path(output_dir: Path, value: object) -> tuple[Path | None, str | None]:
+    """Return a canonical, non-symlinked output member or a refusal reason.
+
+    Manifest ledgers are untrusted input.  A lexical relative-path check alone
+    is insufficient because a valid-looking child can escape through a symlink
+    in either the final component or an existing parent component.
+    """
+    if not isinstance(value, str) or not value:
+        return None, "path is not a non-empty string"
+    if "\\" in value:
+        return None, "path uses a non-portable separator"
+
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None, "path is not a canonical relative path"
+    portable_path = PureWindowsPath(value)
+    native_path = Path(value)
+    if native_path.is_absolute() or portable_path.is_absolute() or portable_path.drive:
+        return None, "path is absolute or drive-qualified"
+
+    try:
+        output_root = realpath(output_dir)
+        target = output_root.joinpath(*parts)
+        component = output_root
+        for part in parts:
+            component /= part
+            if component.is_symlink():
+                return None, "path traverses a symlink"
+        target_real = realpath(target)
+    except (OSError, ValueError):
+        return None, "path cannot be resolved safely"
+    if target_real != output_root and output_root not in target_real.parents:
+        return None, "path resolves outside the output directory"
+    return target, None
+
+
+def _iter_output_files(output_dir: Path, exclude: set[str]) -> tuple[list[str], list[str], list[str]]:
+    """Return regular files, symlinks, and special nodes below ``output_dir``.
+
+    Symlinks are never valid generated payloads.  They are collected
+    separately instead of following them so an unlisted link cannot make an
+    external file appear to be an attested output member.  FIFOs, sockets, and
+    device nodes are likewise neither payload files nor harmless directories.
+    """
     files: list[str] = []
+    symlinks: list[str] = []
+    special_nodes: list[str] = []
     for path in sorted(output_dir.rglob("*")):
-        if path.is_file() and path.name not in exclude:
-            files.append(str(path.relative_to(output_dir)))
-    return files
+        relative = path.relative_to(output_dir).as_posix()
+        if path.is_symlink():
+            symlinks.append(relative)
+        elif path.is_file():
+            if relative not in exclude:
+                files.append(relative)
+        elif not path.is_dir():
+            special_nodes.append(relative)
+    return files, symlinks, special_nodes
+
+
+def _output_inventory_verification(
+    output_dir: Path,
+    file_entries: dict[str, Any],
+    raw_inventory: object,
+) -> dict[str, Any]:
+    """Check that the output inventory is a complete, safe view of the ledger."""
+    check: dict[str, Any] = {
+        "status": "not_applicable",
+        "inventory_files": [],
+        "inventory_directories": [],
+        "missing_paths": [],
+        "invalid_entries": [],
+        "duplicate_paths": [],
+        "unbound_checksum_entries": [],
+        "unbound_inventory_paths": [],
+        "failure_count": 0,
+    }
+    if not isinstance(raw_inventory, list) or not raw_inventory:
+        check["invalid_entries"].append("<output_inventory>")
+    else:
+        seen: set[str] = set()
+        for index, item in enumerate(raw_inventory):
+            if not isinstance(item, dict):
+                check["invalid_entries"].append(f"[{index}]")
+                continue
+            if (
+                not isinstance(item.get("tables"), dict)
+                or not isinstance(item.get("row_counts"), dict)
+                or not isinstance(item.get("generated_manifests"), list)
+            ):
+                check["invalid_entries"].append(f"[{index}]: inventory shape is invalid")
+                continue
+            path = item.get("path")
+            target, reason = _safe_output_member_path(output_dir, path)
+            if target is None:
+                check["invalid_entries"].append(f"[{index}]: {reason}")
+                continue
+            assert isinstance(path, str)  # Established by _safe_output_member_path.
+            if path in seen:
+                check["duplicate_paths"].append(path)
+                continue
+            seen.add(path)
+            if not target.exists():
+                check["missing_paths"].append(path)
+            elif target.is_file():
+                check["inventory_files"].append(path)
+            elif target.is_dir():
+                check["inventory_directories"].append(path)
+            else:
+                check["invalid_entries"].append(f"[{index}]: path is neither a file nor a directory")
+
+    inventory_files = set(check["inventory_files"])
+    inventory_directories = set(check["inventory_directories"])
+    for path in file_entries:
+        if path in inventory_files or any(path.startswith(f"{directory}/") for directory in inventory_directories):
+            continue
+        check["unbound_checksum_entries"].append(path)
+    for path in inventory_files:
+        if path not in file_entries:
+            check["unbound_inventory_paths"].append(path)
+    for directory in inventory_directories:
+        if not any(path.startswith(f"{directory}/") for path in file_entries):
+            check["unbound_inventory_paths"].append(directory)
+
+    check["inventory_files"].sort()
+    check["inventory_directories"].sort()
+    check["missing_paths"].sort()
+    check["invalid_entries"].sort()
+    check["duplicate_paths"].sort()
+    check["unbound_checksum_entries"].sort()
+    check["unbound_inventory_paths"].sort()
+    check["failure_count"] = (
+        len(check["missing_paths"])
+        + len(check["invalid_entries"])
+        + len(check["duplicate_paths"])
+        + len(check["unbound_checksum_entries"])
+        + len(check["unbound_inventory_paths"])
+    )
+    check["status"] = "passed" if check["failure_count"] == 0 else "failed"
+    return check
 
 
 def _sqlite_workspace_v2_verification(
@@ -2484,7 +3221,11 @@ def _array_checksum_verification(
     prediction_ids: set[str] | None,
 ) -> dict[str, Any]:
     """Verify every runtime array row checksum recorded in the manifest."""
-    expected = {key.removeprefix("arrays:"): value for key, value in checksums.items() if key.startswith("arrays:")}
+    expected = {
+        key.removeprefix("arrays:"): value
+        for key, value in checksums.items()
+        if isinstance(key, str) and key.startswith("arrays:")
+    }
     sidecar_paths = sorted(
         rel for rel in file_entries if rel.startswith(f"{_ARRAYS_DIRNAME}/") and rel.endswith(".parquet")
     )
@@ -2561,18 +3302,15 @@ def _array_checksum_verification(
 
 
 def _preserved_payload_verification(
+    output_dir: Path,
     manifest: dict[str, Any],
     file_entries: dict[str, Any],
 ) -> dict[str, Any]:
-    """Verify preserved opaque payload ledger entries against file checksums."""
+    """Verify preserved payload bytes and their semantic unsupported binding."""
     raw_preserved = manifest.get("preserved_opaque", [])
     unsupported = manifest.get("unsupported", [])
     unsupported_preserved = (
-        sum(
-            1
-            for item in unsupported
-            if isinstance(item, dict) and item.get("disposition") == "preserved"
-        )
+        sum(1 for item in unsupported if isinstance(item, dict) and item.get("disposition") == "preserved")
         if isinstance(unsupported, list)
         else 0
     )
@@ -2601,6 +3339,10 @@ def _preserved_payload_verification(
         "duplicate_paths": [],
         "invalid_entries": [],
         "outside_preserved": [],
+        "unmatched_preserved_payloads": [],
+        "unmatched_unsupported_preserved": [],
+        "invalid_legacy_retention": [],
+        "semantic_invalid_entries": [],
         "failure_count": 0,
     }
     if not isinstance(raw_preserved, list):
@@ -2609,44 +3351,97 @@ def _preserved_payload_verification(
         check["status"] = "failed"
         return check
     preserved = raw_preserved
-    if not preserved:
-        if unsupported_preserved:
-            check["missing_opaque_payloads"] = unsupported_preserved
-            check["failure_count"] = unsupported_preserved
-            check["status"] = "failed"
-        return check
 
     seen: set[str] = set()
+    generic_preserved: list[tuple[str, str]] = []
+    has_legacy_array_retention = False
     for index, item in enumerate(preserved):
         if not isinstance(item, dict):
             check["invalid_entries"].append(f"[{index}]")
             continue
         path = item.get("path")
+        reason = item.get("reason")
         checksum = item.get("checksum")
-        if not isinstance(path, str) or not path or not isinstance(checksum, str) or not checksum:
+        if (
+            not isinstance(path, str)
+            or not path
+            or not isinstance(reason, str)
+            or not reason
+            or not isinstance(checksum, str)
+            or not checksum
+        ):
             check["invalid_entries"].append(f"[{index}]")
             continue
         if path in seen:
             check["duplicate_paths"].append(path)
             continue
         seen.add(path)
-        path_obj = Path(path)
-        if path_obj.is_absolute() or ".." in path_obj.parts or not path.startswith(f"{_PRESERVED_DIRNAME}/"):
+        target, _reason = _safe_output_member_path(output_dir, path)
+        if target is None or not path.startswith(f"{_PRESERVED_DIRNAME}/"):
             check["outside_preserved"].append(path)
             continue
         if path in file_entries:
             if file_entries[path] != checksum:
                 check["mismatched_payloads"].append(path)
-            continue
-        child_checksums = {
-            rel: digest for rel, digest in file_entries.items() if rel.startswith(f"{path}/")
-        }
-        if not child_checksums:
-            check["missing_checksums"].append(path)
-            continue
-        aggregate = sha256_bytes(json.dumps(child_checksums, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-        if aggregate != checksum:
-            check["mismatched_payloads"].append(path)
+        else:
+            child_checksums = {rel: digest for rel, digest in file_entries.items() if rel.startswith(f"{path}/")}
+            if not child_checksums:
+                check["missing_checksums"].append(path)
+                continue
+            aggregate = sha256_bytes(json.dumps(child_checksums, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+            if aggregate != checksum:
+                check["mismatched_payloads"].append(path)
+
+        if path == _LEGACY_ARRAYS_JSONL:
+            has_legacy_array_retention = True
+            if reason != "legacy_prediction_arrays":
+                check["invalid_legacy_retention"].append(path)
+        else:
+            generic_preserved.append((path, reason))
+
+    source = manifest.get("source")
+    source_path = source.get("path") if isinstance(source, dict) else None
+    expected_generic: list[tuple[str, str]] = []
+    legacy_unsupported: list[str] = []
+    if not isinstance(unsupported, list):
+        check["semantic_invalid_entries"].append("<unsupported>")
+    else:
+        for index, item in enumerate(unsupported):
+            if not isinstance(item, dict):
+                check["semantic_invalid_entries"].append(f"unsupported[{index}]")
+                continue
+            item_name = item.get("item")
+            disposition = item.get("disposition")
+            source_kind = item.get("source_kind")
+            if item_name == "prediction_arrays":
+                if not isinstance(disposition, str):
+                    check["semantic_invalid_entries"].append(f"unsupported[{index}]")
+                else:
+                    legacy_unsupported.append(disposition)
+                continue
+            if disposition != "preserved":
+                continue
+            if not isinstance(item_name, str) or not isinstance(source_kind, str) or not source_kind:
+                check["semantic_invalid_entries"].append(f"unsupported[{index}]")
+                continue
+            if item_name == ".":
+                if not isinstance(source_path, str) or not source_path:
+                    check["semantic_invalid_entries"].append(f"unsupported[{index}]")
+                    continue
+                item_name = Path(source_path).name or "root"
+            expected_generic.append((f"{_PRESERVED_DIRNAME}/{source_kind}/{item_name}", source_kind))
+
+    expected_counts = Counter(expected_generic)
+    actual_counts = Counter(generic_preserved)
+    for (path, _reason), count in sorted((actual_counts - expected_counts).items()):
+        check["unmatched_preserved_payloads"].extend([path] * count)
+    for (path, _reason), count in sorted((expected_counts - actual_counts).items()):
+        check["unmatched_unsupported_preserved"].extend([path] * count)
+    if legacy_unsupported:
+        if not has_legacy_array_retention:
+            check["unmatched_unsupported_preserved"].append(_LEGACY_ARRAYS_JSONL)
+        if any(disposition != "preserved" for disposition in legacy_unsupported):
+            check["invalid_legacy_retention"].append(_LEGACY_ARRAYS_JSONL)
 
     check["missing_opaque_payloads"] = max(0, unsupported_preserved - len(preserved))
     check["failure_count"] = (
@@ -2656,22 +3451,45 @@ def _preserved_payload_verification(
         + len(check["duplicate_paths"])
         + len(check["invalid_entries"])
         + len(check["outside_preserved"])
+        + len(check["unmatched_preserved_payloads"])
+        + len(check["unmatched_unsupported_preserved"])
+        + len(check["invalid_legacy_retention"])
+        + len(check["semantic_invalid_entries"])
     )
     check["status"] = "passed" if check["failure_count"] == 0 else "failed"
     return check
 
 
 def _verification_summary_from_manifest(
-    output_dir: Path, manifest: dict[str, Any], exclude_names: set[str] | None = None
+    output_dir: Path, manifest: object, exclude_paths: set[str] | None = None
 ) -> dict[str, Any]:
     """Build the shared verification summary for ``migrate --verify`` and ``verify``."""
-    checksums: dict[str, Any] = manifest.get("checksums", {})
-    file_entries = {k: v for k, v in checksums.items() if not k.startswith("arrays:")}
+    output_dir = realpath(output_dir)
+    manifest_shape_errors = _manifest_contract_shape_errors(manifest)
+    manifest_document = manifest if isinstance(manifest, dict) else {}
+    raw_checksums = manifest_document.get("checksums", {})
+    checksums: dict[str, Any] = raw_checksums if isinstance(raw_checksums, dict) else {}
+    file_entries: dict[str, Any] = {}
+    file_paths: dict[str, Path] = {}
+    invalid_checksum_paths: list[str] = []
+    if not isinstance(raw_checksums, dict):
+        invalid_checksum_paths.append("<checksums>")
+    else:
+        for raw_path, digest in raw_checksums.items():
+            if isinstance(raw_path, str) and raw_path.startswith("arrays:"):
+                continue
+            target, _reason = _safe_output_member_path(output_dir, raw_path)
+            if target is None:
+                invalid_checksum_paths.append(raw_path if isinstance(raw_path, str) else "<non-string checksum key>")
+                continue
+            assert isinstance(raw_path, str)  # Established by _safe_output_member_path.
+            file_entries[raw_path] = digest
+            file_paths[raw_path] = target
 
     missing: list[str] = []
     mismatched: list[str] = []
     for rel, expected in file_entries.items():
-        target = output_dir / rel
+        target = file_paths[rel]
         if not target.is_file():
             missing.append(rel)
             continue
@@ -2684,26 +3502,44 @@ def _verification_summary_from_manifest(
         contracts.DEFAULT_ID_MAP_NAME,
         contracts.DEFAULT_UNSUPPORTED_REPORT_NAME,
     }
-    if exclude_names is not None:
-        exclude.update(exclude_names)
-    orphans = [rel for rel in _iter_output_files(output_dir, exclude) if rel not in file_entries]
+    if exclude_paths is not None:
+        exclude.update(exclude_paths)
+    output_files, unsafe_output_paths, special_output_paths = _iter_output_files(output_dir, exclude)
+    orphans = [rel for rel in output_files if rel not in file_entries]
+    inventory_check = _output_inventory_verification(
+        output_dir, file_entries, manifest_document.get("output_inventory")
+    )
     sqlite_check, prediction_ids = _sqlite_workspace_v2_verification(output_dir, file_entries)
     array_check = _array_checksum_verification(output_dir, checksums, file_entries, prediction_ids)
-    preserved_check = _preserved_payload_verification(manifest, file_entries)
+    preserved_check = _preserved_payload_verification(output_dir, manifest_document, file_entries)
 
     checks = {
+        "manifest_contract_shape": {
+            "status": "passed" if not manifest_shape_errors else "failed",
+            "errors": manifest_shape_errors,
+            "failure_count": len(manifest_shape_errors),
+        },
         "manifest_checksums_present": len(file_entries),
+        "invalid_checksum_paths": sorted(invalid_checksum_paths),
         "missing_files": missing,
         "mismatched_files": mismatched,
         "orphan_files": orphans,
+        "unsafe_output_paths": unsafe_output_paths,
+        "special_output_paths": special_output_paths,
+        "output_inventory_coverage": inventory_check,
         "sqlite_integrity_check": sqlite_check,
         "array_checksum_coverage": array_check,
         "preserved_payload_coverage": preserved_check,
     }
     mismatches = (
-        len(missing)
+        len(manifest_shape_errors)
+        + len(invalid_checksum_paths)
+        + len(missing)
         + len(mismatched)
         + len(orphans)
+        + len(unsafe_output_paths)
+        + len(special_output_paths)
+        + int(inventory_check["failure_count"])
         + len(sqlite_check["errors"])
         + int(array_check["failure_count"])
         + int(preserved_check["failure_count"])
@@ -2721,14 +3557,24 @@ def _raise_if_verification_failed(summary: dict[str, Any]) -> None:
     if summary["passed"]:
         return
     checks = summary["checks"]
+    manifest_shape_failures = int(checks["manifest_contract_shape"]["failure_count"])
+    invalid_checksum_paths = len(checks["invalid_checksum_paths"])
+    unsafe_output_paths = len(checks["unsafe_output_paths"])
+    special_output_paths = len(checks["special_output_paths"])
+    inventory_failures = int(checks["output_inventory_coverage"]["failure_count"])
     sqlite_failures = len(checks["sqlite_integrity_check"]["errors"])
     array_failures = int(checks["array_checksum_coverage"]["failure_count"])
     preserved_failures = int(checks["preserved_payload_coverage"]["failure_count"])
     raise VerificationFailed(
         "verification failed: "
+        f"{manifest_shape_failures} manifest contract shape failure(s), "
+        f"{invalid_checksum_paths} invalid checksum path(s), "
         f"{len(checks['missing_files'])} missing, "
         f"{len(checks['mismatched_files'])} mismatched, "
         f"{len(checks['orphan_files'])} orphan file(s), "
+        f"{unsafe_output_paths} symlinked output path(s), "
+        f"{special_output_paths} special output path(s), "
+        f"{inventory_failures} inventory failure(s), "
         f"{sqlite_failures} sqlite failure(s), "
         f"{array_failures} array failure(s), "
         f"{preserved_failures} preserved payload failure(s)",
@@ -2746,7 +3592,7 @@ def verify(output_dir: Path, *, manifest_path: Path, report_path: Path | None = 
     preserved opaque payload ledger entries are checked when present.
     """
     try:
-        manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise UnsupportedInput(
             f"cannot read manifest {manifest_path}: {exc}",
@@ -2754,16 +3600,19 @@ def verify(output_dir: Path, *, manifest_path: Path, report_path: Path | None = 
             mitigation="point --manifest at a valid migration-manifest.json",
         ) from exc
 
-    exclude_names = {manifest_path.name}
-    if report_path is not None:
-        exclude_names.add(report_path.name)
-    summary = _verification_summary_from_manifest(output_dir, manifest, exclude_names)
+    exclude_paths = _contract_exclude_paths(output_dir, manifest_path, report_path)
+    summary = _verification_summary_from_manifest(output_dir, manifest, exclude_paths)
 
+    manifest_document = manifest if isinstance(manifest, dict) else {}
+    target = manifest_document.get("target")
+    source = manifest_document.get("source")
+    target_kind = target.get("kind") if isinstance(target, dict) else ""
+    source_kinds = source.get("kinds") if isinstance(source, dict) else []
     report = contracts.build_report(
         status=vocab.STATUS_SUCCESS if summary["passed"] else vocab.STATUS_VERIFICATION_FAILED,
-        target_kind=str(manifest.get("target", {}).get("kind", "")),
+        target_kind=str(target_kind),
         target_path=str(output_dir),
-        source_kinds=list(manifest.get("source", {}).get("kinds", [])),
+        source_kinds=list(source_kinds) if isinstance(source_kinds, list) else [],
     )
     report["verification_summary"] = summary
     if report_path is not None:

@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from nirs4all_tools import commands, policy, vocab
+from nirs4all_tools import commands, contracts, policy, vocab
 from nirs4all_tools.checksums import sha256_file
 from nirs4all_tools.errors import PolicyRefusal, SourceIntegrityError, UnsupportedInput, VerificationFailed
 from nirs4all_tools.exit_codes import ExitCode
@@ -506,9 +507,7 @@ def test_migrate_legacy_workspace_preserves_non_lowerable_payloads(
     assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
 
 
-def test_migrate_sqlite_legacy_arrays_to_workspace_v2(
-    sqlite_legacy_arrays_workspace: Path, tmp_path: Path
-) -> None:
+def test_migrate_sqlite_legacy_arrays_to_workspace_v2(sqlite_legacy_arrays_workspace: Path, tmp_path: Path) -> None:
     out = tmp_path / "out"
 
     def run() -> None:
@@ -740,9 +739,7 @@ def test_migrate_sqlite_legacy_arrays_best_effort_preserves_length_mismatch(tmp_
     assert report["verification_summary"]["passed"] is True
 
 
-def test_migrate_native_results_preserves_opaque_best_effort(
-    native_results_dir: Path, tmp_path: Path
-) -> None:
+def test_migrate_native_results_preserves_opaque_best_effort(native_results_dir: Path, tmp_path: Path) -> None:
     out = tmp_path / "out"
 
     def run() -> None:
@@ -964,9 +961,7 @@ def test_migrate_loose_predictions_nonfinite_array_refuses_cleanly(tmp_path: Pat
     assert policy.diff_snapshots(before, after) == []
 
 
-def test_migrate_native_results_lowers_preview_metadata(
-    lowerable_native_results_dir: Path, tmp_path: Path
-) -> None:
+def test_migrate_native_results_lowers_preview_metadata(lowerable_native_results_dir: Path, tmp_path: Path) -> None:
     out = tmp_path / "out"
 
     def run() -> None:
@@ -999,9 +994,9 @@ def test_migrate_native_results_lowers_preview_metadata(
     assert unsupported["unsupported"] == []
     assert "store.sqlite" in manifest["checksums"]
     assert "arrays/dataset-a.parquet" in manifest["checksums"]
-    assert f"preserved/native-results-v1/{lowerable_native_results_dir.name}/predictions.parquet" in manifest[
-        "checksums"
-    ]
+    assert (
+        f"preserved/native-results-v1/{lowerable_native_results_dir.name}/predictions.parquet" in manifest["checksums"]
+    )
     assert report["status"] == vocab.STATUS_SUCCESS
     assert report["migrated_counts"]["runs"] == 1
     assert report["migrated_counts"]["pipelines"] == 1
@@ -1024,9 +1019,7 @@ def test_migrate_native_results_lowers_preview_metadata(
             """
         ).fetchone()
         assert row == ("run-native-1", "dataset-a", "PLSRegression", "fold-0", "val", "rmse", "regression", 3)
-        pipeline = con.execute(
-            "SELECT run_id, dataset_name, status, metric FROM pipelines"
-        ).fetchone()
+        pipeline = con.execute("SELECT run_id, dataset_name, status, metric FROM pipelines").fetchone()
         assert pipeline == ("run-native-1", "dataset-a", "completed", "rmse")
     finally:
         con.close()
@@ -1099,9 +1092,7 @@ def test_migrate_native_results_lowered_preserved_payload_is_byte_identical_and_
     assert report["verification_summary"]["checks"]["mismatched_files"] == [preserved_rel]
 
 
-def test_migrate_native_results_strict_refuses_without_output(
-    native_results_dir: Path, tmp_path: Path
-) -> None:
+def test_migrate_native_results_strict_refuses_without_output(native_results_dir: Path, tmp_path: Path) -> None:
     out = tmp_path / "out"
     with pytest.raises(UnsupportedInput) as exc:
         commands.migrate(
@@ -1116,9 +1107,7 @@ def test_migrate_native_results_strict_refuses_without_output(
     assert not out.exists()
 
 
-def test_migrate_n4a_bundle_preserves_opaque_best_effort(
-    n4a_bundle: Path, tmp_path: Path
-) -> None:
+def test_migrate_n4a_bundle_preserves_opaque_best_effort(n4a_bundle: Path, tmp_path: Path) -> None:
     out = tmp_path / "out"
     code = commands.migrate(
         n4a_bundle,
@@ -1135,6 +1124,71 @@ def test_migrate_n4a_bundle_preserves_opaque_best_effort(
     assert f"preserved/n4a-bundle/{n4a_bundle.name}" in manifest["checksums"]
     assert manifest["preserved_opaque"][0]["reason"] == "n4a-bundle"
     assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
+
+
+def test_relative_n4a_symlink_uses_canonical_root_source(
+    n4a_bundle: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    links = tmp_path / "links"
+    links.mkdir()
+    source_alias = links / "source-alias.n4a"
+    try:
+        os.symlink(f"../{n4a_bundle.name}", source_alias)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+
+    monkeypatch.chdir(links)
+    relative_source = Path(source_alias.name)
+    assert commands.inspect(relative_source, fmt="json") == ExitCode.SUCCESS
+
+    out = tmp_path / "out"
+    assert (
+        commands.migrate(
+            relative_source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        == ExitCode.MIGRATED_WITH_WARNINGS
+    )
+
+    manifest = json.loads((out / contracts.DEFAULT_MANIFEST_NAME).read_text(encoding="utf-8"))
+    expected = f"preserved/n4a-bundle/{n4a_bundle.name}"
+    assert manifest["source"]["path"] == str(n4a_bundle.resolve())
+    assert manifest["preserved_opaque"][0]["path"] == expected
+    assert commands.verify(out, manifest_path=out / contracts.DEFAULT_MANIFEST_NAME) == ExitCode.SUCCESS
+
+
+def test_relative_unsafe_n4a_symlink_keeps_archive_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_unsafe_n4a_bundle(tmp_path / "unsafe.n4a")
+    links = tmp_path / "links"
+    links.mkdir()
+    source_alias = links / "source-alias.n4a"
+    try:
+        os.symlink("../unsafe.n4a", source_alias)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+
+    monkeypatch.chdir(links)
+    out = tmp_path / "out"
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            Path(source_alias.name),
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "unsafe_member_path" in raised.value.message
+    assert not out.exists()
 
 
 def test_copy_only_n4a_bundle_copies_the_validated_archive(n4a_bundle: Path, tmp_path: Path) -> None:
@@ -1468,6 +1522,790 @@ def test_copy_only_round_trip_and_verify(sqlite_v2_workspace: Path, tmp_path: Pa
     assert commands.verify(out, manifest_path=manifest) == ExitCode.SUCCESS
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot create a literal backslash filename")
+@pytest.mark.parametrize("verify", [False, True])
+def test_copy_only_refuses_literal_backslash_source_entry_before_output(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    verify: bool,
+) -> None:
+    (sqlite_v2_workspace / r"back\slash.txt").write_text("nonportable", encoding="utf-8")
+    out = tmp_path / "out"
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            verify=verify,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "literal backslash" in raised.value.message
+    assert not out.exists()
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+
+
+# --- migrate: attested resume ------------------------------------------------
+def test_migrate_resume_copy_only_is_a_read_only_attested_noop(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    assert (
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+        == ExitCode.SUCCESS
+    )
+
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+    output_before = policy.snapshot_tree(out)
+    assert (
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+        == ExitCode.SUCCESS
+    )
+
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+@pytest.mark.parametrize(
+    ("copy_only", "expected_code", "expected_status", "mutated_status"),
+    [
+        (True, ExitCode.SUCCESS, vocab.STATUS_SUCCESS, vocab.STATUS_MIGRATED_WITH_WARNINGS),
+        (False, ExitCode.MIGRATED_WITH_WARNINGS, vocab.STATUS_MIGRATED_WITH_WARNINGS, vocab.STATUS_SUCCESS),
+    ],
+)
+def test_migrate_resume_requires_manifest_attested_terminal_outcome(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    copy_only: bool,
+    expected_code: ExitCode,
+    expected_status: str,
+    mutated_status: str,
+) -> None:
+    out = tmp_path / "out"
+    assert (
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=copy_only,
+            tool_version="0.0.1",
+        )
+        == expected_code
+    )
+
+    manifest_path = out / contracts.DEFAULT_MANIFEST_NAME
+    report_path = out / contracts.DEFAULT_REPORT_NAME
+    unsupported_path = out / contracts.DEFAULT_UNSUPPORTED_REPORT_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    assert manifest["migration"]["terminal_status"] == expected_status
+    assert manifest["migration"]["terminal_exit_code"] == int(expected_code)
+    assert report["status"] == expected_status
+    assert unsupported["status"] == expected_status
+
+    # A coordinated report-only relabelling must not alter the durable result
+    # the manifest attested before all four contracts were written.
+    report["status"] = mutated_status
+    unsupported["status"] = mutated_status
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    unsupported_path.write_text(json.dumps(unsupported, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+    output_before = policy.snapshot_tree(out)
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=copy_only,
+            resume=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_migrate_resume_refuses_pre_terminal_manifest_but_verify_stays_available(
+    sqlite_v2_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    assert (
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+        == ExitCode.SUCCESS
+    )
+
+    manifest_path = out / contracts.DEFAULT_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["migration"] = {"mode": "copy-only"}
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    assert commands.verify(out, manifest_path=manifest_path) == ExitCode.SUCCESS
+
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+    output_before = policy.snapshot_tree(out)
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+@pytest.mark.parametrize(
+    ("contract_name", "schema_id", "schema_version"),
+    [
+        (contracts.DEFAULT_REPORT_NAME, contracts.REPORT_SCHEMA_ID, contracts.REPORT_SCHEMA_VERSION),
+        (
+            contracts.DEFAULT_UNSUPPORTED_REPORT_NAME,
+            contracts.UNSUPPORTED_REPORT_SCHEMA_ID,
+            contracts.UNSUPPORTED_REPORT_SCHEMA_VERSION,
+        ),
+    ],
+)
+def test_migrate_resume_refuses_truncated_internal_report_contracts(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    contract_name: str,
+    schema_id: str,
+    schema_version: int,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    contract_path = out / contract_name
+    contract_path.write_text(
+        json.dumps({"$id": schema_id, "schema_version": schema_version}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    output_before = policy.snapshot_tree(out)
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_migrate_resume_refuses_unsupported_report_count_mismatch(n4a_bundle: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    assert (
+        commands.migrate(
+            n4a_bundle,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            tool_version="0.0.1",
+        )
+        == ExitCode.MIGRATED_WITH_WARNINGS
+    )
+    unsupported_path = out / contracts.DEFAULT_UNSUPPORTED_REPORT_NAME
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    assert unsupported["counts"]["preserved"] == 1
+    unsupported["counts"]["preserved"] = 0
+    unsupported_path.write_text(json.dumps(unsupported, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    source_before = policy.snapshot_tree(n4a_bundle)
+    output_before = policy.snapshot_tree(out)
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            n4a_bundle,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            resume=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(n4a_bundle)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_verify_and_resume_refuse_truncated_embedded_id_map(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    truncated_id_map = {
+        "$id": contracts.ID_MAP_SCHEMA_ID,
+        "schema_version": contracts.ID_MAP_SCHEMA_VERSION,
+    }
+    manifest_path = out / contracts.DEFAULT_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["old_to_new_ids"] = truncated_id_map
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out / contracts.DEFAULT_ID_MAP_NAME).write_text(
+        json.dumps(truncated_id_map, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+    output_before = policy.snapshot_tree(out)
+    verification_report = tmp_path / "verification-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=verification_report)
+    summary = json.loads(verification_report.read_text(encoding="utf-8"))["verification_summary"]
+    assert summary["checks"]["manifest_contract_shape"] == {
+        "status": "failed",
+        "errors": ["id-map entity set is incomplete"],
+        "failure_count": 1,
+    }
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_verify_handles_a_non_object_manifest_as_a_verification_failure(
+    sqlite_v2_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    manifest_path = out / contracts.DEFAULT_MANIFEST_NAME
+    manifest_path.write_text("[]\n", encoding="utf-8")
+
+    verification_report = tmp_path / "verification-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=verification_report)
+    summary = json.loads(verification_report.read_text(encoding="utf-8"))["verification_summary"]
+    assert summary["checks"]["manifest_contract_shape"] == {
+        "status": "failed",
+        "errors": ["manifest is not a JSON object"],
+        "failure_count": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "contract_name",
+    [
+        "migration-manifest.json",
+        "migration-report.json",
+        "migration-id-map.json",
+        "unsupported-report.json",
+    ],
+)
+def test_migrate_resume_refuses_each_missing_internal_contract(
+    sqlite_v2_workspace: Path, tmp_path: Path, contract_name: str
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    (out / contract_name).unlink()
+    output_before = policy.snapshot_tree(out)
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_migrate_resume_refuses_malformed_or_partial_manifest_without_touching_output(
+    sqlite_v2_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    manifest_path = out / "migration-manifest.json"
+    valid_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_path.write_text("{not-json", encoding="utf-8")
+    output_before = policy.snapshot_tree(out)
+
+    with pytest.raises(UnsupportedInput) as malformed:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert malformed.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+    valid_manifest["tool"]["completed_at"] = None
+    manifest_path.write_text(json.dumps(valid_manifest), encoding="utf-8")
+    output_before = policy.snapshot_tree(out)
+    with pytest.raises(UnsupportedInput) as partial:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert partial.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_migrate_resume_requires_matching_source_path_and_fingerprint(
+    sqlite_v2_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    same_bytes_elsewhere = tmp_path / "other-source"
+    same_bytes_elsewhere.mkdir()
+    (same_bytes_elsewhere / "store.sqlite").write_bytes((sqlite_v2_workspace / "store.sqlite").read_bytes())
+    output_before = policy.snapshot_tree(out)
+
+    with pytest.raises(UnsupportedInput) as path_mismatch:
+        commands.migrate(
+            same_bytes_elsewhere,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert path_mismatch.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+    (sqlite_v2_workspace / "post-migration-change.txt").write_text("changed", encoding="utf-8")
+    output_before = policy.snapshot_tree(out)
+    with pytest.raises(UnsupportedInput) as fingerprint_mismatch:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert fingerprint_mismatch.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_migrate_resume_requires_matching_target_and_mode(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+    copy_out = tmp_path / "copy-out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=copy_out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    output_before = policy.snapshot_tree(copy_out)
+    with pytest.raises(UnsupportedInput) as target_mismatch:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=copy_out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert target_mismatch.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(copy_out)) == []
+
+    best_effort_out = tmp_path / "best-effort-out"
+    assert (
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=best_effort_out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            tool_version="0.0.1",
+        )
+        == ExitCode.MIGRATED_WITH_WARNINGS
+    )
+    output_before = policy.snapshot_tree(best_effort_out)
+    with pytest.raises(UnsupportedInput) as mode_mismatch:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=best_effort_out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert mode_mismatch.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(best_effort_out)) == []
+
+
+@pytest.mark.parametrize("tamper", ["checksum", "orphan", "nested_contract"])
+def test_migrate_resume_refuses_checksum_or_orphan_without_touching_output(
+    sqlite_v2_workspace: Path, tmp_path: Path, tamper: str
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    if tamper == "checksum":
+        (out / "payload" / "store.sqlite").write_bytes(b"tampered")
+    elif tamper == "orphan":
+        (out / "payload" / "orphan.txt").write_text("orphan", encoding="utf-8")
+    else:
+        (out / "payload" / contracts.DEFAULT_MANIFEST_NAME).write_text("nested contract", encoding="utf-8")
+    output_before = policy.snapshot_tree(out)
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+@pytest.mark.parametrize(
+    ("replace_payload_directory", "unsafe_path"),
+    [(False, "payload/store.sqlite"), (True, "payload")],
+)
+def test_verify_and_resume_refuse_attested_payload_symlink_without_writing(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    replace_payload_directory: bool,
+    unsafe_path: str,
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    payload = out / "payload" / "store.sqlite"
+    external = tmp_path / ("external-payload" if replace_payload_directory else "external-store.sqlite")
+    external_store = external / "store.sqlite" if replace_payload_directory else external
+    if replace_payload_directory:
+        external.mkdir()
+    external_store.write_bytes(payload.read_bytes())
+    payload.unlink()
+    try:
+        if replace_payload_directory:
+            payload.parent.rmdir()
+            os.symlink(external, payload.parent, target_is_directory=True)
+        else:
+            os.symlink(external, payload)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+    output_before = policy.snapshot_tree(out)
+    verification_report = tmp_path / "verification-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=out / "migration-manifest.json", report_path=verification_report)
+    summary = json.loads(verification_report.read_text(encoding="utf-8"))["verification_summary"]
+    assert summary["checks"]["invalid_checksum_paths"] == ["payload/store.sqlite"]
+    assert summary["checks"]["unsafe_output_paths"] == [unsafe_path]
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="the platform does not support FIFO nodes")
+def test_verify_and_resume_refuse_special_output_node_without_writing(
+    sqlite_v2_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    special = out / "payload" / "unlisted.fifo"
+    os.mkfifo(special)
+
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+    manifest_before = (out / contracts.DEFAULT_MANIFEST_NAME).read_bytes()
+    special_before = special.stat()
+    verification_report = tmp_path / "verification-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=out / contracts.DEFAULT_MANIFEST_NAME, report_path=verification_report)
+    summary = json.loads(verification_report.read_text(encoding="utf-8"))["verification_summary"]
+    assert summary["checks"]["special_output_paths"] == ["payload/unlisted.fifo"]
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert (out / contracts.DEFAULT_MANIFEST_NAME).read_bytes() == manifest_before
+    assert stat.S_ISFIFO(special.stat().st_mode)
+    assert special.stat().st_mtime_ns == special_before.st_mtime_ns
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert (out / contracts.DEFAULT_MANIFEST_NAME).read_bytes() == manifest_before
+    assert stat.S_ISFIFO(special.stat().st_mode)
+    assert special.stat().st_mtime_ns == special_before.st_mtime_ns
+
+
+@pytest.mark.parametrize("tamper", ["checksum", "inventory"])
+def test_verify_and_resume_refuse_ledger_traversal_without_writing(
+    sqlite_v2_workspace: Path, tmp_path: Path, tamper: str
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    manifest_path = out / "migration-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if tamper == "checksum":
+        payload = out / "payload" / "store.sqlite"
+        external = tmp_path / "external-store.sqlite"
+        external.write_bytes(payload.read_bytes())
+        payload.unlink()
+        manifest["checksums"]["../external-store.sqlite"] = sha256_file(external)
+        del manifest["checksums"]["payload/store.sqlite"]
+    else:
+        manifest["output_inventory"][0]["path"] = "../external-payload"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+    output_before = policy.snapshot_tree(out)
+    verification_report = tmp_path / "verification-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=verification_report)
+    summary = json.loads(verification_report.read_text(encoding="utf-8"))["verification_summary"]
+    if tamper == "checksum":
+        assert summary["checks"]["invalid_checksum_paths"] == ["../external-store.sqlite"]
+    else:
+        inventory = summary["checks"]["output_inventory_coverage"]
+        assert inventory["status"] == "failed"
+        assert inventory["invalid_entries"] == ["[0]: path is not a canonical relative path"]
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_migrate_resume_refuses_external_contract_path_and_missing_or_empty_output(
+    sqlite_v2_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+    output_before = policy.snapshot_tree(out)
+    with pytest.raises(UnsupportedInput) as external_manifest:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            manifest_path=tmp_path / "external-manifest.json",
+            tool_version="0.0.1",
+        )
+    assert external_manifest.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+    missing_output = tmp_path / "missing-output"
+    with pytest.raises(UnsupportedInput) as missing:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=missing_output,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert missing.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert not missing_output.exists()
+
+    empty_output = tmp_path / "empty-output"
+    empty_output.mkdir()
+    output_before = policy.snapshot_tree(empty_output)
+    with pytest.raises(UnsupportedInput) as empty:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=empty_output,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            resume=True,
+            tool_version="0.0.1",
+        )
+    assert empty.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(empty_output)) == []
+
+
+@pytest.mark.parametrize(
+    ("argument", "filename"),
+    [
+        ("manifest_path", contracts.DEFAULT_MANIFEST_NAME),
+        ("report_path", contracts.DEFAULT_REPORT_NAME),
+        ("id_map_path", contracts.DEFAULT_ID_MAP_NAME),
+        ("unsupported_report_path", contracts.DEFAULT_UNSUPPORTED_REPORT_NAME),
+    ],
+)
+def test_migrate_refuses_nondefault_internal_contract_paths_before_writing(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    argument: str,
+    filename: str,
+) -> None:
+    out = tmp_path / "out"
+    kwargs = {argument: out / "contracts" / filename}
+    source_before = policy.snapshot_tree(sqlite_v2_workspace)
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+            **kwargs,
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert not out.exists()
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
+
+
+def test_migrate_allows_an_external_custom_manifest_path(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    external_manifest = tmp_path / "contracts" / "custom-manifest.json"
+
+    assert (
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            manifest_path=external_manifest,
+            copy_only=True,
+            verify=True,
+            tool_version="0.0.1",
+        )
+        == ExitCode.SUCCESS
+    )
+
+    assert external_manifest.exists()
+    assert not (out / contracts.DEFAULT_MANIFEST_NAME).exists()
+    assert commands.verify(out, manifest_path=external_manifest) == ExitCode.SUCCESS
+
+
 def test_copy_only_manifest_uses_contract_inventory_shape(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
     out = tmp_path / "out"
     commands.migrate(
@@ -1518,12 +2356,13 @@ def test_verify_detects_tampering(sqlite_v2_workspace: Path, tmp_path: Path) -> 
         commands.verify(out, manifest_path=out / "migration-manifest.json")
 
 
-def test_verify_detects_orphan_file(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("filename", ["surprise.txt", contracts.DEFAULT_MANIFEST_NAME])
+def test_verify_detects_orphan_file(sqlite_v2_workspace: Path, tmp_path: Path, filename: str) -> None:
     out = tmp_path / "out"
     commands.migrate(
         sqlite_v2_workspace, output=out, target=vocab.TARGET_WORKSPACE_V2, copy_only=True, tool_version="0.0.1"
     )
-    (out / "payload" / "surprise.txt").write_text("unlisted", encoding="utf-8")
+    (out / "payload" / filename).write_text("unlisted", encoding="utf-8")
     with pytest.raises(VerificationFailed):
         commands.verify(out, manifest_path=out / "migration-manifest.json")
 
@@ -1598,9 +2437,7 @@ def test_verify_requires_preserved_opaque_ledger_when_opaque_payloads_exist(
 
     manifest_path = out / "migration-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    unsupported_preserved = sum(
-        1 for item in manifest["unsupported"] if item["disposition"] == "preserved"
-    )
+    unsupported_preserved = sum(1 for item in manifest["unsupported"] if item["disposition"] == "preserved")
     assert unsupported_preserved > 0
     manifest["preserved_opaque"] = []
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1629,9 +2466,7 @@ def test_verify_requires_preserved_opaque_key_when_opaque_payloads_exist(
 
     manifest_path = out / "migration-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    unsupported_preserved = sum(
-        1 for item in manifest["unsupported"] if item["disposition"] == "preserved"
-    )
+    unsupported_preserved = sum(1 for item in manifest["unsupported"] if item["disposition"] == "preserved")
     del manifest["preserved_opaque"]
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -1643,6 +2478,68 @@ def test_verify_requires_preserved_opaque_key_when_opaque_payloads_exist(
     coverage = report["verification_summary"]["checks"]["preserved_payload_coverage"]
     assert coverage["status"] == "failed"
     assert coverage["missing_opaque_payloads"] == unsupported_preserved
+
+
+def test_verify_and_resume_reject_preserved_opaque_disposition_relabelling(
+    n4a_bundle: Path,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    assert (
+        commands.migrate(
+            n4a_bundle,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            tool_version="0.0.1",
+        )
+        == ExitCode.MIGRATED_WITH_WARNINGS
+    )
+
+    manifest_path = out / contracts.DEFAULT_MANIFEST_NAME
+    report_path = out / contracts.DEFAULT_REPORT_NAME
+    unsupported_path = out / contracts.DEFAULT_UNSUPPORTED_REPORT_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    unsupported_report = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    preserved_path = manifest["preserved_opaque"][0]["path"]
+    assert manifest["unsupported"][0]["disposition"] == "preserved"
+
+    # Keep the report ledgers mutually consistent while falsely relabelling
+    # the raw opaque bytes as refused.  Verification must bind the payload to
+    # the deterministic preserved unsupported record, not merely compare counts.
+    manifest["unsupported"][0]["disposition"] = "refused"
+    report["unsupported_counts"].update({"preserved": 0, "refused": 1})
+    unsupported_report["unsupported"] = manifest["unsupported"]
+    unsupported_report["counts"].update({"preserved": 0, "refused": 1})
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    unsupported_path.write_text(json.dumps(unsupported_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    source_before = policy.snapshot_tree(n4a_bundle)
+    output_before = policy.snapshot_tree(out)
+    verification_report = tmp_path / "verification-report.json"
+    with pytest.raises(VerificationFailed):
+        commands.verify(out, manifest_path=manifest_path, report_path=verification_report)
+    coverage = json.loads(verification_report.read_text(encoding="utf-8"))["verification_summary"]["checks"][
+        "preserved_payload_coverage"
+    ]
+    assert coverage["status"] == "failed"
+    assert coverage["unmatched_preserved_payloads"] == [preserved_path]
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(n4a_bundle)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            n4a_bundle,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            resume=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
+    assert policy.diff_snapshots(source_before, policy.snapshot_tree(n4a_bundle)) == []
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
 
 
 def test_verify_rejects_invalid_preserved_opaque_ledger(
@@ -1726,9 +2623,7 @@ def test_verify_rejects_preserved_opaque_paths_outside_preserved(
     assert coverage["outside_preserved"] == ["payload/not-preserved"]
 
 
-def test_verify_detects_array_row_checksum_mismatch(
-    sqlite_legacy_arrays_workspace: Path, tmp_path: Path
-) -> None:
+def test_verify_detects_array_row_checksum_mismatch(sqlite_legacy_arrays_workspace: Path, tmp_path: Path) -> None:
     pytest.importorskip("pyarrow")
     import pyarrow as pa
     import pyarrow.parquet as pq

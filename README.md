@@ -31,7 +31,8 @@ Every command guarantees the source is never modified:
 - the source is opened **read-only** (SQLite via `file:…?mode=ro&immutable=1`);
 - `--output` is **mandatory** and must be **disjoint** from the input
   (aliasing / nesting is refused, exit `40`);
-- the output must be **empty** unless `--resume`;
+- the output must be **empty**; `--resume` is only a read-only, attested no-op
+  for an already complete output, never a continuation of a partial migration;
 - the whole source tree is snapshotted `(path, size, mtime_ns)` before and after
   **every** run — including failure and abort paths — and asserted byte-for-byte
   identical (a mismatch is exit `70`).
@@ -69,6 +70,27 @@ nirs4all-tools legacy export-n4mm <trusted-pls.joblib> --output DIR --trusted-lo
 ```
 
 Current schema-transform support is intentionally narrow:
+
+`--resume` is deliberately not crash recovery. It accepts only an output whose
+four default in-output contracts are complete and mutually consistent, whose
+source path/fingerprint, target, and migration mode match the current command,
+and whose checksums and output inventory still verify. It does not write any
+file and returns the prior terminal code (`0` or `10`). External contract paths
+are never resume authority. Missing, external, malformed, partial, or
+mismatching contract state is refused with code `20`.
+Here, *attested* means internally consistent contracts, inventories, and
+checksums; it is not a cryptographic signature or protection against an actor
+that can rewrite every output contract and payload coherently.
+
+For a real migration, the only contract paths allowed inside `--output` are
+the four default root files. Custom manifest, report, id-map, or unsupported
+report paths must be external to `--output`; this keeps later standalone
+`legacy verify` checks unambiguous.
+
+`--copy-only` preserves bytes only when source entry names are representable in
+the portable slash-separated checksum ledger. In particular, a POSIX filename
+containing a literal backslash is refused before output creation rather than
+creating an output that cannot later verify.
 
 - `legacy export-n4mm` can, only after explicit `--trusted-load-joblib`, prove
   a finite affine equation from exactly a fitted sklearn `PLSRegression` and
@@ -134,9 +156,9 @@ Current schema-transform support is intentionally narrow:
 |------|---------|
 | `0`  | success, no warnings |
 | `10` | migrated with warnings (best-effort preserved opaque / non-fatal skips) |
-| `20` | unsupported input (unknown, unsafe archive, forward-version source, or strict unsupported item) |
+| `20` | unsupported input (unknown, unsafe archive, forward-version source, strict unsupported item, or unattested `--resume`) |
 | `30` | verification failed |
-| `40` | refused by policy (in-place / aliased output, non-empty output without `--resume`) |
+| `40` | refused by policy (in-place / aliased output, or non-empty fresh output) |
 | `70` | internal error (incl. source-tree integrity assertion failure) |
 
 ## Contracts

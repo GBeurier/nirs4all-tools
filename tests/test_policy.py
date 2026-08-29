@@ -78,8 +78,10 @@ def test_output_available_refuses_non_empty(tmp_path: Path) -> None:
     (out / "stale.txt").write_text("x", encoding="utf-8")
     with pytest.raises(PolicyRefusal):
         policy.assert_output_available(out, resume=False)
-    # ...but --resume permits it.
-    policy.assert_output_available(out, resume=True)
+    # ``--resume`` never makes this low-level guard permissive; the command
+    # layer separately accepts only a complete internally attested output.
+    with pytest.raises(PolicyRefusal):
+        policy.assert_output_available(out, resume=True)
 
 
 def test_output_available_refuses_file(tmp_path: Path) -> None:

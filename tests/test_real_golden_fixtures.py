@@ -11,7 +11,7 @@ import pytest
 
 from nirs4all_tools import commands, policy, vocab
 from nirs4all_tools.checksums import sha256_file
-from nirs4all_tools.errors import PolicyRefusal, UnsupportedInput
+from nirs4all_tools.errors import UnsupportedInput
 from nirs4all_tools.exit_codes import ExitCode
 
 FIXTURES = Path(__file__).parent / "fixtures" / "legacy"
@@ -292,15 +292,13 @@ def test_golden_standalone_legacy_runs_manifest_lowers_predictions(tmp_path: Pat
     assert report["migrated_counts"]["chains"] == 1
     assert report["migrated_counts"]["predictions"] == 1
     assert report["migrated_counts"]["arrays"] == 1
-    assert report["target_summary"]["preview"]["manifest_file"] == (
-        "runs/run-2024-legacy/pipeline-pls/manifest.yaml"
-    )
+    assert report["target_summary"]["preview"]["manifest_file"] == ("runs/run-2024-legacy/pipeline-pls/manifest.yaml")
     assert report["target_summary"]["preview"]["prediction_file"] == "run_predictions.json"
     assert report["verification_summary"]["passed"] is True
 
-    assert (runs_payload / "run-2024-legacy" / "pipeline-pls" / "manifest.yaml").read_text(
-        encoding="utf-8"
-    ) == (source / "runs" / "run-2024-legacy" / "pipeline-pls" / "manifest.yaml").read_text(encoding="utf-8")
+    assert (runs_payload / "run-2024-legacy" / "pipeline-pls" / "manifest.yaml").read_text(encoding="utf-8") == (
+        source / "runs" / "run-2024-legacy" / "pipeline-pls" / "manifest.yaml"
+    ).read_text(encoding="utf-8")
     assert (loose_payload / "run_predictions.json").read_text(encoding="utf-8") == (
         source / "run_predictions.json"
     ).read_text(encoding="utf-8")
@@ -636,31 +634,32 @@ def test_golden_standalone_loose_predictions_missing_parquet_strict_refuses_with
     _assert_source_unchanged(source, before)
 
 
-def test_golden_legacy_workspace_resume_requires_opt_in_and_verifies(tmp_path: Path) -> None:
+def test_golden_legacy_workspace_resume_is_attested_read_only_noop(tmp_path: Path) -> None:
     source = _copy_fixture_tree("old_workspace_mixed", tmp_path)
     out = tmp_path / "out"
-    out.mkdir()
-    (out / "migration-report.json").write_text('{"stale": true}\n', encoding="utf-8")
     before = policy.snapshot_tree(source)
 
-    with pytest.raises(PolicyRefusal):
-        commands.migrate(source, output=out, target=vocab.TARGET_WORKSPACE_V2, tool_version="0.0.1")
+    initial_code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        verify=True,
+        tool_version="0.0.1",
+    )
+    assert initial_code == ExitCode.MIGRATED_WITH_WARNINGS
+    output_before = policy.snapshot_tree(out)
 
     code = commands.migrate(
         source,
         output=out,
         target=vocab.TARGET_WORKSPACE_V2,
         resume=True,
-        verify=True,
         tool_version="0.0.1",
     )
 
     assert code == ExitCode.MIGRATED_WITH_WARNINGS
     _assert_source_unchanged(source, before)
-    report = _read_json(out / "migration-report.json")
-    unsupported = _read_json(out / "unsupported-report.json")
-    assert report["verification_summary"]["passed"] is True
-    assert unsupported["counts"]["preserved"] == 3
+    assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
 
 
 def test_golden_sqlite_legacy_arrays_lowers_metadata_and_preserves_rows(tmp_path: Path) -> None:
