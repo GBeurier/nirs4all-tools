@@ -25,7 +25,7 @@ class ExitCode(IntEnum):
     """A verification check did not pass."""
 
     REFUSED_BY_POLICY = 40
-    """In-place / aliased output, or a non-empty output without ``--resume``."""
+    """In-place / aliased output, or a non-empty fresh output."""
 
     INTERNAL_ERROR = 70
     """Internal error, including a source-tree integrity assertion failure."""

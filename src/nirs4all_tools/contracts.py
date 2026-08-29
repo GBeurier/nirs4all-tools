@@ -113,6 +113,17 @@ def build_manifest(
             "detected_versions": detected_versions,
         },
         "target": {"kind": target_kind, "schema_version": target_schema_version},
+        # The command sets this to the exact invocation mode before writing.
+        # A completed output can then be resumed only as an attested no-op,
+        # never as a permissive continuation of a partial migration.
+        "migration": {
+            "mode": None,
+            # A completed runner attests these together before any contract is
+            # persisted.  ``--resume`` must not infer its process code from
+            # mutable report files alone.
+            "terminal_status": None,
+            "terminal_exit_code": None,
+        },
         "input_inventory": [],
         "output_inventory": [],
         "checksums": {},

@@ -5,7 +5,8 @@ This module enforces, *before any byte is written*, the rules from
 
 * the source is opened read-only (``read_only_sqlite_uri``);
 * ``--output`` is mandatory and **disjoint** from the source (``assert_disjoint``);
-* the output must be empty unless ``--resume`` (``assert_output_available``);
+* a fresh output must be empty (``assert_output_available``); command-level
+  ``--resume`` is a separately validated, read-only attested no-op;
 * explicit report/manifest paths must resolve **outside** the source tree
   (``assert_path_outside_source``);
 * the whole source tree is snapshotted ``(path, size, mtime_ns, sha256)`` before
@@ -98,11 +99,13 @@ def assert_path_outside_source(source: Path, path: Path) -> None:
         )
 
 
-def assert_output_available(output: Path, *, resume: bool) -> None:
-    """Refuse a non-empty output directory unless ``--resume`` was given.
+def assert_output_available(output: Path, *, resume: bool = False) -> None:
+    """Refuse a non-empty output directory.
 
     A path that exists but is not a directory is always refused
-    (``SW4_MIG_CONVERTER_spec.md`` §3.3).
+    (``SW4_MIG_CONVERTER_spec.md`` §3.3). ``migrate`` handles ``--resume``
+    before this guard through its complete-contract attestation; the parameter
+    remains only for compatibility with existing internal callers.
     """
     out = realpath(output)
     if not out.exists():
@@ -113,11 +116,11 @@ def assert_output_available(output: Path, *, resume: bool) -> None:
             cause=vocab.CAUSE_NON_EMPTY_OUTPUT,
             mitigation="choose a fresh, empty output directory",
         )
-    if any(out.iterdir()) and not resume:
+    if any(out.iterdir()):
         raise PolicyRefusal(
             f"output directory is not empty: {out}",
             cause=vocab.CAUSE_NON_EMPTY_OUTPUT,
-            mitigation="use a fresh empty directory, or pass --resume to continue a prior run",
+            mitigation="use a fresh empty directory, or pass --resume only for a complete verified prior output",
         )
 
 

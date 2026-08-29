@@ -97,18 +97,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="target schema (native-results-v1 is Phase-2, gated)",
     )
     mig.add_argument(
-        "--manifest", type=Path, default=None, help="manifest path (default: <output>/migration-manifest.json)"
+        "--manifest",
+        type=Path,
+        default=None,
+        help="manifest path (default: <output>/migration-manifest.json; custom path must be outside --output)",
     )
-    mig.add_argument("--report", type=Path, default=None, help="report path (default: <output>/migration-report.json)")
     mig.add_argument(
-        "--id-map", dest="id_map", type=Path, default=None, help="id-map path (default: <output>/migration-id-map.json)"
+        "--report",
+        type=Path,
+        default=None,
+        help="report path (default: <output>/migration-report.json; custom path must be outside --output)",
+    )
+    mig.add_argument(
+        "--id-map",
+        dest="id_map",
+        type=Path,
+        default=None,
+        help="id-map path (default: <output>/migration-id-map.json; custom path must be outside --output)",
     )
     mig.add_argument(
         "--unsupported-report",
         dest="unsupported_report",
         type=Path,
         default=None,
-        help="machine-readable unsupported-item report (default: <output>/unsupported-report.json)",
+        help=(
+            "machine-readable unsupported-item report "
+            "(default: <output>/unsupported-report.json; custom path is external)"
+        ),
     )
     mig.add_argument("--checksums", choices=["sha256"], default="sha256", help="checksum algorithm")
     mode = mig.add_mutually_exclusive_group()
@@ -120,10 +135,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--best-effort", dest="best_effort", action="store_true", help="preserve unsupported items opaque (default)"
     )
     mig.add_argument(
-        "--copy-only", dest="copy_only", action="store_true", help="faithful checksummed copy, no schema transform"
+        "--copy-only",
+        dest="copy_only",
+        action="store_true",
+        help="faithful checksummed copy for portable source names; no schema transform",
     )
     mig.add_argument(
-        "--resume", action="store_true", help="continue into a non-empty output validated by a prior manifest"
+        "--resume",
+        action="store_true",
+        help="read-only no-op for one complete, internally verified prior migration (never crash recovery)",
     )
     mig.add_argument(
         "--trusted-load-joblib",
