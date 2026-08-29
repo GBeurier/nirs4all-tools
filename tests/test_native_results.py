@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,32 @@ def test_native_results_preview_refuses_multidimensional_y_true_or_y_pred_shape(
     assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
     assert field in exc.value.message
     assert "workspace-v2 sidecars preserve only flat" in exc.value.message
+
+
+@pytest.mark.parametrize("schema_version", [2, 1, 0, True, 3.0, "3", 4])
+def test_native_results_preview_refuses_every_noncurrent_manifest_schema_before_parquet_read(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    run_dir = tmp_path / "native-results"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "run_id": "run-native-1",
+                "engine": "dag-ml",
+                "score_set_hash": "not-read-before-schema-gate",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UnsupportedInput) as exc:
+        load_native_results_preview(run_dir)
+
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "exact manifest.schema_version 3" in exc.value.message
 
 
 def test_native_results_proba_arrays_lower_to_flat_sidecar_record() -> None:

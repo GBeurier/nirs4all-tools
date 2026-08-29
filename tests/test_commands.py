@@ -36,6 +36,14 @@ def _mark_native_results_as_multidimensional(path: Path) -> None:
     pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), predictions)
 
 
+def _set_native_results_schema_version(path: Path, schema_version: object) -> None:
+    """Alter only the source declaration for fail-closed schema-gate tests."""
+    manifest_path = path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = schema_version
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def _write_unsafe_n4a_bundle(path: Path) -> Path:
     """Create a deliberately traversal-bearing archive without extracting it."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -343,6 +351,86 @@ def test_migrate_native_results_dry_run_reports_lowerable_preview(
     assert unsupported["counts"] == {"unsupported": 0, "preserved": 0, "refused": 0, "opaque_payloads": 0}
     assert unsupported["unsupported"] == []
     assert any(item["source_kind"] == "native-results-v1" for item in manifest["input_inventory"])
+
+
+def test_migrate_old_native_results_schema_dry_run_would_preserve_without_output(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    _set_native_results_schema_version(lowerable_native_results_dir, 2)
+    out = tmp_path / "out"
+    manifest_path = tmp_path / "preview-manifest.json"
+    unsupported_path = tmp_path / "unsupported-report.json"
+
+    code = commands.migrate(
+        lowerable_native_results_dir,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        dry_run=True,
+        manifest_path=manifest_path,
+        unsupported_report_path=unsupported_path,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.SUCCESS
+    assert not out.exists()
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    entry = unsupported["unsupported"][0]
+    assert entry["source_kind"] == "native-results-v1"
+    assert entry["disposition"] == "would_preserve"
+    assert entry["cause"] == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "exact manifest.schema_version 3" in entry["reason"]
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["unsupported"] == unsupported["unsupported"]
+
+
+def test_migrate_future_native_results_schema_dry_run_reports_forward_refusal_without_output(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    _set_native_results_schema_version(lowerable_native_results_dir, 4)
+    out = tmp_path / "out"
+    manifest_path = tmp_path / "preview-manifest.json"
+    unsupported_path = tmp_path / "unsupported-report.json"
+
+    code = commands.migrate(
+        lowerable_native_results_dir,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        dry_run=True,
+        manifest_path=manifest_path,
+        unsupported_report_path=unsupported_path,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.UNSUPPORTED_INPUT
+    assert not out.exists()
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    entry = unsupported["unsupported"][0]
+    assert entry["source_kind"] == "native-results-v1"
+    assert entry["disposition"] == "refused"
+    assert entry["cause"] == vocab.CAUSE_FORWARD_VERSION
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_migrate_future_native_results_schema_refuses_before_output(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+    strict: bool,
+) -> None:
+    _set_native_results_schema_version(lowerable_native_results_dir, 4)
+    out = tmp_path / "out"
+
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            lowerable_native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=strict,
+            tool_version="0.0.1",
+        )
+
+    assert exc.value.cause == vocab.CAUSE_FORWARD_VERSION
+    assert not out.exists()
 
 
 # --- migrate: best-effort preservation and transforms ----------------------
@@ -687,6 +775,53 @@ def test_migrate_native_results_preserves_opaque_best_effort(
     assert report["status"] == vocab.STATUS_MIGRATED_WITH_WARNINGS
     assert report["preserved_counts"]["opaque_artifacts"] == 1
     assert report["verification_summary"]["passed"] is True
+
+
+def test_migrate_old_native_results_schema_preserves_opaque_best_effort(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    _set_native_results_schema_version(lowerable_native_results_dir, 2)
+    out = tmp_path / "out"
+
+    code = commands.migrate(
+        lowerable_native_results_dir,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        verify=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.MIGRATED_WITH_WARNINGS
+    preserved_root = out / "preserved" / "native-results-v1" / lowerable_native_results_dir.name
+    assert (preserved_root / "manifest.json").exists()
+    manifest = json.loads((out / "migration-manifest.json").read_text(encoding="utf-8"))
+    entry = manifest["unsupported"][0]
+    assert entry["source_kind"] == "native-results-v1"
+    assert entry["disposition"] == "preserved"
+    assert entry["cause"] == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "exact manifest.schema_version 3" in entry["reason"]
+
+
+def test_migrate_old_native_results_schema_strict_refuses_without_output(
+    lowerable_native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    _set_native_results_schema_version(lowerable_native_results_dir, 2)
+    out = tmp_path / "out"
+
+    with pytest.raises(UnsupportedInput) as exc:
+        commands.migrate(
+            lowerable_native_results_dir,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            strict=True,
+            tool_version="0.0.1",
+        )
+
+    assert exc.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "exact manifest.schema_version 3" in exc.value.message
+    assert not out.exists()
 
 
 def test_migrate_native_results_multidimensional_arrays_dry_run_would_preserve(

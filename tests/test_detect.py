@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_n4a_bundle
+from conftest import make_n4a_bundle, make_native_results_dir
 from nirs4all_tools import detect
 
 
@@ -118,6 +118,17 @@ def test_detect_current_native_results(lowerable_native_results_dir: Path) -> No
     assert art.detected_version == 3
     assert art.forward_version is False
     assert art.supported is True
+
+
+def test_detect_future_native_results_schema_is_forward_version(tmp_path: Path) -> None:
+    source = make_native_results_dir(tmp_path / "native-results", schema_version=4)
+
+    result = detect.detect_sources(source)
+
+    art = result.artifacts[0]
+    assert art.detected_version == 4
+    assert art.forward_version is True
+    assert art.supported is False
 
 
 def test_detect_n4a_py_bundle(tmp_path: Path) -> None:

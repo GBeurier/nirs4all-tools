@@ -4,6 +4,14 @@ All notable changes to **nirs4all-tools** are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+- Refuse semantic lowering of `native-results-v1` directories unless their
+  manifest declares the exact current integer `schema_version: 3`. Older or
+  non-canonical variants remain opaque in best-effort mode and are refused by
+  `--strict` before output creation.
+
 ## [0.0.6] — 2026-08-25
 
 ### Fixed
