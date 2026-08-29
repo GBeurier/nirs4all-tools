@@ -55,6 +55,8 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.7.0",
     "build>=1.0.0",
+    # CI executes the strict DuckDB source-profile witness.
+    "duckdb>=1.0.0",
     "joblib>=1.2",
     "scikit-learn>=1.0",
 ]
