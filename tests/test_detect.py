@@ -22,6 +22,19 @@ def test_detect_sqlite_v2(sqlite_v2_workspace: Path) -> None:
     assert result.has_recognized is True
 
 
+def test_detect_direct_directory_symlink_resolves_only_its_root(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
+    alias = tmp_path / "workspace-alias"
+    try:
+        os.symlink(sqlite_v2_workspace, alias, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+
+    result = detect.detect_sources(alias)
+
+    assert result.root == str(sqlite_v2_workspace)
+    assert detect.KIND_SQLITE_WORKSPACE_V2 in result.kinds
+
+
 def test_detect_legacy_arrays(legacy_arrays_workspace: Path) -> None:
     result = detect.detect_sources(legacy_arrays_workspace)
     assert detect.KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS in result.kinds

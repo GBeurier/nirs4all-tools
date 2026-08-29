@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from nirs4all_tools import policy
-from nirs4all_tools.errors import PolicyRefusal, SourceIntegrityError
+from nirs4all_tools.errors import PolicyRefusal, SourceIntegrityError, UnsupportedInput
 
 
 def test_read_only_sqlite_uri_is_immutable(tmp_path: Path) -> None:
@@ -152,3 +152,228 @@ def test_snapshot_diff_detects_removal(tmp_path: Path) -> None:
     a.unlink()
     after = policy.snapshot_tree(src)
     assert "a.txt" in policy.diff_snapshots(before, after)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="the platform does not support FIFO nodes")
+def test_snapshot_tree_records_a_fifo_without_opening_it(tmp_path: Path) -> None:
+    src = tmp_path / "ws"
+    src.mkdir()
+    os.mkfifo(src / "blocked.fifo")
+
+    snapshot = policy.snapshot_tree(src)
+
+    assert snapshot.entries["blocked.fifo"][0] == -2
+
+
+def test_safe_source_tree_refuses_a_descendant_symlink(tmp_path: Path) -> None:
+    src = tmp_path / "ws"
+    src.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    try:
+        os.symlink(outside, src / "escaped.txt")
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+
+    with pytest.raises(UnsupportedInput) as raised:
+        policy.assert_safe_source_tree(src)
+
+    assert raised.value.cause == "unsupported_shape"
+
+
+def test_copy_regular_file_nofollow_rejects_a_parent_symlink_swap(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    original_parent = source_root / "payload"
+    original_parent.mkdir(parents=True)
+    (original_parent / "source.txt").write_text("inside", encoding="utf-8")
+    external_parent = tmp_path / "external"
+    external_parent.mkdir()
+    (external_parent / "source.txt").write_text("outside", encoding="utf-8")
+    held_parent = source_root / "payload-held"
+    original_parent.rename(held_parent)
+    try:
+        os.symlink(external_parent, original_parent, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+
+    destination = tmp_path / "output" / "copied.txt"
+    with pytest.raises(UnsupportedInput) as raised:
+        policy.copy_regular_file_nofollow(original_parent / "source.txt", destination)
+
+    assert raised.value.cause == "unsupported_shape"
+    assert not destination.exists()
+
+
+def test_safe_source_fallback_without_posix_nofollow_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "payload.txt"
+    source.write_text("portable", encoding="utf-8")
+    monkeypatch.delattr(policy.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.delattr(policy.os, "O_DIRECTORY", raising=False)
+
+    policy.assert_safe_source_tree(source_root)
+    destination = tmp_path / "output" / "payload.txt"
+    policy.copy_regular_file_nofollow(source, destination)
+
+    assert destination.read_text(encoding="utf-8") == "portable"
+
+
+def test_materialized_source_stage_fails_closed_without_posix_nofollow_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("portable", encoding="utf-8")
+    monkeypatch.delattr(policy.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.delattr(policy.os, "O_DIRECTORY", raising=False)
+
+    with pytest.raises(UnsupportedInput) as raised:
+        with policy.materialized_source_tree_nofollow(source):
+            pass
+
+    assert raised.value.cause == "unsupported_capability"
+
+
+def test_materialized_source_stage_refuses_tmpdir_inside_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "payload.txt").write_text("payload", encoding="utf-8")
+    unsafe_tmpdir = source / "tmp"
+    monkeypatch.setattr(policy.tempfile, "gettempdir", lambda: str(unsafe_tmpdir))
+
+    with pytest.raises(PolicyRefusal):
+        with policy.materialized_source_tree_nofollow(source):
+            pass
+
+    assert not unsafe_tmpdir.exists()
+
+
+def test_materialized_source_stage_refuses_tmpdir_at_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "payload.txt").write_text("payload", encoding="utf-8")
+    output = tmp_path / "output"
+    output.mkdir()
+    monkeypatch.setattr(policy.tempfile, "gettempdir", lambda: str(output))
+
+    with pytest.raises(PolicyRefusal):
+        with policy.materialized_source_tree_nofollow(source, forbidden_paths=(output,)):
+            pass
+
+
+def test_materialized_source_stage_is_private_and_cleans_up(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    payload = nested / "payload.txt"
+    payload.write_text("payload", encoding="utf-8")
+    staged_root: Path | None = None
+
+    with policy.materialized_source_tree_nofollow(source) as staged:
+        staged_root = staged.path
+        staged_payload = staged.path / "nested" / "payload.txt"
+        assert staged_payload.read_text(encoding="utf-8") == "payload"
+        assert (staged.path / "nested").stat().st_mode & 0o777 == 0o700
+        assert staged_payload.stat().st_mode & 0o777 == 0o600
+
+    assert staged_root is not None
+    assert not staged_root.parent.exists()
+
+
+def test_materialized_source_stage_rejects_root_replacement_between_lstat_and_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "payload.txt").write_text("original", encoding="utf-8")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "payload.txt").write_text("replacement", encoding="utf-8")
+    held = tmp_path / "held"
+    original_open_directory = policy._open_directory_source
+
+    def replace_then_open(path: Path):
+        source.rename(held)
+        replacement.rename(source)
+        return original_open_directory(path)
+
+    monkeypatch.setattr(policy, "_open_directory_source", replace_then_open)
+    yielded = False
+    with pytest.raises(SourceIntegrityError):
+        with policy.materialized_source_tree_nofollow(source):
+            yielded = True
+
+    assert not yielded
+
+
+def test_materialized_source_stage_rejects_child_symlink_between_lstat_and_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = source / "payload.txt"
+    payload.write_text("original", encoding="utf-8")
+    external = tmp_path / "external.txt"
+    external.write_text("external", encoding="utf-8")
+    held = tmp_path / "held-payload.txt"
+    original_open_child = policy._open_child_nofollow
+    swapped = False
+
+    def swap_then_open(*args, **kwargs):
+        nonlocal swapped
+        if not swapped and args[1] == payload.name:
+            swapped = True
+            payload.rename(held)
+            try:
+                os.symlink(external, payload)
+            except OSError as exc:
+                held.rename(payload)
+                pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+        return original_open_child(*args, **kwargs)
+
+    monkeypatch.setattr(policy, "_open_child_nofollow", swap_then_open)
+    yielded = False
+    try:
+        with pytest.raises(UnsupportedInput) as raised:
+            with policy.materialized_source_tree_nofollow(source):
+                yielded = True
+    finally:
+        if payload.is_symlink():
+            payload.unlink()
+        if held.exists():
+            held.rename(payload)
+
+    assert raised.value.cause == "unsupported_shape"
+    assert not yielded
+
+
+def test_source_guard_nofollow_detects_identical_root_directory_replacement(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source_file = source / "payload.txt"
+    source_file.write_text("payload", encoding="utf-8")
+    source_file_stat = source_file.stat()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    replacement_file = replacement / "payload.txt"
+    replacement_file.write_text("payload", encoding="utf-8")
+    os.utime(replacement_file, ns=(source_file_stat.st_atime_ns, source_file_stat.st_mtime_ns))
+    held = tmp_path / "held"
+    before = policy.snapshot_tree_nofollow(source)
+
+    with pytest.raises(SourceIntegrityError):
+        with policy.source_guard_nofollow(source, before=before):
+            source.rename(held)
+            replacement.rename(source)

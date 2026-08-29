@@ -72,10 +72,15 @@ from .policy import (
     assert_disjoint,
     assert_output_available,
     assert_path_outside_source,
+    assert_safe_source_tree,
+    copy_regular_file_nofollow,
+    materialized_source_tree_nofollow,
     read_only_sqlite_uri,
     realpath,
     snapshot_tree,
+    snapshot_tree_nofollow,
     source_guard,
+    source_guard_nofollow,
 )
 from .workspace_v2 import WORKSPACE_V2_TABLES, create_workspace_v2_schema
 
@@ -212,12 +217,14 @@ def _source_fingerprint(source: Path) -> str:
 
 def _source_fingerprint_from_snapshot(snapshot: TreeSnapshot) -> str:
     """Return the durable source fingerprint already represented by one snapshot."""
-    root = Path(snapshot.root)
     entries: list[dict[str, Any]] = []
-    if root.is_file():
-        st = root.stat()
-        size, _mtime, digest = snapshot.entries.get(".", (st.st_size, st.st_mtime_ns, sha256_file(root)))
-        entries.append({"kind": "file", "path": ".", "sha256": digest, "size": size})
+    root_entry = snapshot.entries.get(".")
+    if root_entry is not None:
+        size, _mtime, digest = root_entry
+        if size >= 0:
+            entries.append({"kind": "file", "path": ".", "sha256": digest, "size": size})
+        else:
+            entries.append({"kind": "directory" if size == -1 else "unreadable", "path": "."})
     else:
         for rel in sorted(snapshot.entries):
             size, _mtime, digest = snapshot.entries[rel]
@@ -239,9 +246,8 @@ def _assert_copy_only_source_paths_are_portable(snapshot: TreeSnapshot) -> None:
     ``Path.parts`` distinguishes that POSIX literal from a native Windows path
     separator.
     """
-    root = Path(snapshot.root)
-    if root.is_file():
-        candidates = [root.name]
+    if "." in snapshot.entries:
+        candidates = [snapshot.root.name or "root"]
     else:
         candidates = [relative for relative, (size, _mtime, _digest) in snapshot.entries.items() if size >= 0]
     nonportable = sorted(
@@ -298,7 +304,7 @@ def _copy_validated_detected_n4a_archive(
 
 def _copy_recursive_n4a_archive(source: Path, destination: Path, *, relative_path: str) -> None:
     """Detect, gate, and copy a nested opaque N4A with the direct-file path."""
-    detection = detect_sources(source)
+    detection = detect_sources(source, allow_root_symlink=False)
     if len(detection.artifacts) != 1 or detection.artifacts[0].source_kind != KIND_N4A_BUNDLE:
         raise SourceIntegrityError(
             f"nested .n4a source changed before it could be copied: {relative_path}",
@@ -330,7 +336,7 @@ def _refresh_dry_run_detection(
     after the initial read-only detection, so refresh all recorded source
     facts under the second integrity guard rather than report stale facts.
     """
-    detection = detect_sources(input_path)
+    detection = detect_sources(input_path, allow_root_symlink=False)
     manifest["source"]["fingerprint"] = _source_fingerprint(input_path)
     manifest["source"]["kinds"] = detection.kinds
     manifest["source"]["detected_versions"] = detection.detected_versions
@@ -404,11 +410,18 @@ def inspect(input_path: Path, *, fmt: str = "json", report_path: Path | None = N
     outside the source tree.
     """
     input_path = realpath(input_path)
+    assert_safe_source_tree(input_path)
     if report_path is not None:
-        assert_path_outside_source(input_path, report_path)
+        assert_path_outside_source(input_path, report_path, source_is_canonical=True)
 
-    with source_guard(input_path):
-        detection = detect_sources(input_path)
+    with (
+        materialized_source_tree_nofollow(input_path, source_is_canonical=True) as staged_source,
+        source_guard_nofollow(input_path, before=staged_source.source_snapshot),
+    ):
+        detection = detect_sources(staged_source.path, allow_root_symlink=False)
+        # The private stage is deliberately invisible in user-facing
+        # reports: it only binds subsequent readers to the initial source.
+        detection.root = str(input_path)
 
     supported = detection.has_recognized and all(artifact.supported for artifact in detection.artifacts)
     status = vocab.STATUS_SUCCESS if supported else vocab.STATUS_UNSUPPORTED_INPUT
@@ -497,6 +510,88 @@ def _migration_mode(*, strict: bool, copy_only: bool) -> str:
     if copy_only:
         return _RESUME_MODE_COPY_ONLY
     return _RESUME_MODE_STRICT if strict else _RESUME_MODE_BEST_EFFORT
+
+
+def _validate_migrate_options(
+    *,
+    target: str,
+    checksums_algo: str,
+    dry_run: bool,
+    strict: bool,
+    copy_only: bool,
+    resume: bool,
+    trusted_load_joblib: bool,
+) -> None:
+    """Refuse unsupported command-option combinations before source reads."""
+    if target == vocab.TARGET_NATIVE_RESULTS_V1:
+        raise UnsupportedInput(
+            "Phase-2 target 'native-results-v1' is gated on LOCK-REL + dag-ml V1 schema + DML-008",
+            cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+            mitigation="use --target nirs4all-workspace-v2 (Phase 1)",
+        )
+    if target != vocab.TARGET_WORKSPACE_V2:
+        raise UnsupportedInput(
+            f"unknown --target {target!r}",
+            cause=vocab.CAUSE_INVALID_REQUEST,
+            mitigation=f"use --target {vocab.TARGET_WORKSPACE_V2}",
+        )
+    if checksums_algo != "sha256":
+        raise UnsupportedInput(
+            f"unsupported --checksums {checksums_algo!r}",
+            cause=vocab.CAUSE_INVALID_REQUEST,
+            mitigation="only sha256 is supported",
+        )
+    if trusted_load_joblib:
+        raise UnsupportedInput(
+            "--trusted-load-joblib is reserved for the schema-transform engine and is not implemented in this scaffold",
+            cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
+            mitigation="omit --trusted-load-joblib; dry-run/copy-only never execute joblib payloads",
+        )
+    if strict and (dry_run or copy_only):
+        raise UnsupportedInput(
+            "--strict only applies to schema transforms; it has no effect with --dry-run or --copy-only",
+            cause=vocab.CAUSE_INVALID_REQUEST,
+            mitigation="omit --strict for dry-run/copy-only, or wait for the schema-transform engine",
+        )
+    if resume and dry_run:
+        raise UnsupportedInput(
+            "--resume is only available for an already completed output, not --dry-run",
+            cause=vocab.CAUSE_INVALID_REQUEST,
+            mitigation="omit --resume for a dry-run, or use --resume alone to attest an existing output",
+        )
+
+
+def _prepare_migration_contract_paths(
+    *,
+    source_path: Path,
+    output: Path,
+    manifest_path: Path | None,
+    report_path: Path | None,
+    id_map_path: Path | None,
+    unsupported_report_path: Path | None,
+    dry_run: bool,
+) -> tuple[Path | None, Path | None, Path | None, Path | None]:
+    """Resolve and validate migration contract locations without reading source bytes."""
+    paths = _resolve_contract_paths(
+        output=output,
+        manifest_path=manifest_path,
+        report_path=report_path,
+        id_map_path=id_map_path,
+        unsupported_report_path=unsupported_report_path,
+        dry_run=dry_run,
+    )
+    for explicit in paths:
+        if explicit is not None:
+            assert_path_outside_source(source_path, explicit, source_is_canonical=True)
+    if not dry_run:
+        _require_default_internal_contract_paths(
+            output,
+            manifest_path=paths[0],
+            report_path=paths[1],
+            id_map_path=paths[2],
+            unsupported_report_path=paths[3],
+        )
+    return paths
 
 
 def _terminal_exit_code_for_status(status: object) -> ExitCode | None:
@@ -766,6 +861,14 @@ def _resume_realpath(value: object) -> Path | None:
         return None
 
 
+def _resume_canonical_source_path(value: object) -> Path | None:
+    """Return an already-canonical persisted source path without resolving it again."""
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = Path(value)
+    return candidate if candidate.is_absolute() else None
+
+
 def _resume_terminal_outcome(migration: dict[str, Any]) -> tuple[str, ExitCode]:
     """Return the manifest-attested terminal outcome or refuse stale state."""
     status = migration.get("terminal_status")
@@ -879,7 +982,7 @@ def _resume_completed_migration(
         raise _resume_refusal("the manifest target schema does not match this invocation")
     if not isinstance(source_document, dict):
         raise _resume_refusal("the manifest source binding is missing")
-    if _resume_realpath(source_document.get("path")) != realpath(input_path):
+    if _resume_canonical_source_path(source_document.get("path")) != input_path:
         raise _resume_refusal("the manifest source path does not match this invocation")
     if source_document.get("fingerprint") != source_fingerprint:
         raise _resume_refusal("the manifest source fingerprint does not match this invocation")
@@ -964,27 +1067,41 @@ def _copy_only(
     No schema interpretation happens — this is the ``--copy-only`` safety hatch
     (``SW4_MIG_CONVERTER_spec.md`` §6). Returns the ``checksums`` map.
     """
+    assert_safe_source_tree(source)
     payload_root = output / _PAYLOAD_DIRNAME
     checksums: dict[str, str] = {}
     snapshot = snapshot_tree(source)
-    src_real = Path(snapshot.root)
+    src_real = Path(source)
     n4a_by_path = {artifact.path: artifact for artifact in n4a_artifacts}
     file_count = 0
-    if src_real.is_file():
+    if "." in snapshot.entries:
         dest = payload_root / src_real.name
         key = f"{_PAYLOAD_DIRNAME}/{src_real.name}"
         artifact = n4a_by_path.get(".")
         if artifact is not None:
             _copy_validated_detected_n4a_archive(src_real, dest, artifact)
         else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_real, dest)
-        checksums[key] = sha256_file(dest)
+            copy_regular_file_nofollow(src_real, dest)
+        copied_digest = sha256_file(dest)
+        expected = snapshot.entries.get(".", (0, 0, None))[2]
+        if expected is None or copied_digest != expected:
+            raise SourceIntegrityError(
+                "source changed while its copy-only payload was being created",
+                cause=vocab.CAUSE_RUNTIME_ERROR,
+                mitigation="rerun migration against a stable source",
+            )
+        checksums[key] = copied_digest
         file_count = 1
     else:
         for rel, (size, _mtime, _sha256) in snapshot.entries.items():
-            if size < 0:  # directory marker
+            if size == -1:  # directory marker
                 continue
+            if size < 0:
+                raise UnsupportedInput(
+                    f"source contains an unsupported filesystem node at {rel!r}",
+                    cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                    mitigation="replace unreadable, symlinked, or special source entries before migration",
+                )
             src_file = src_real / rel
             dest = payload_root / rel
             artifact = n4a_by_path.get(rel)
@@ -993,9 +1110,15 @@ def _copy_only(
             elif is_n4a_bundle_name(src_file.name):
                 _copy_recursive_n4a_archive(src_file, dest, relative_path=rel)
             else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_file, dest)
-            checksums[f"{_PAYLOAD_DIRNAME}/{rel}"] = sha256_file(dest)
+                copy_regular_file_nofollow(src_file, dest)
+            copied_digest = sha256_file(dest)
+            if _sha256 is None or copied_digest != _sha256:
+                raise SourceIntegrityError(
+                    f"source changed while copy-only payload {rel!r} was being created",
+                    cause=vocab.CAUSE_RUNTIME_ERROR,
+                    mitigation="rerun migration against a stable source",
+                )
+            checksums[f"{_PAYLOAD_DIRNAME}/{rel}"] = copied_digest
             file_count += 1
     manifest["checksums"] = checksums
     manifest["output_inventory"] = [
@@ -1471,7 +1594,7 @@ def _refuse_unsupported_detected_n4a_archives(detection: DetectionResult) -> Non
 
 def _artifact_preserved_rel(input_path: Path, art: DetectedArtifact) -> str:
     """Stable destination under ``preserved/`` for one opaque artifact."""
-    name = (realpath(input_path).name or "root") if art.path == "." else art.path
+    name = (input_path.name or "root") if art.path == "." else art.path
     return f"{_PRESERVED_DIRNAME}/{art.source_kind}/{name}"
 
 
@@ -1496,25 +1619,48 @@ def _unsupported_entry(
 
 def _copy_preserved_artifact(source: Path, dest: Path, rel_prefix: str) -> dict[str, str]:
     """Copy one opaque artifact and return file-level checksums keyed by output path."""
+    assert_safe_source_tree(source)
     checksums: dict[str, str] = {}
-    if source.is_file():
+    snapshot = snapshot_tree(source)
+    if "." in snapshot.entries:
+        _size, _mtime, expected = snapshot.entries["."]
         if is_n4a_bundle_name(source.name):
             _copy_recursive_n4a_archive(source, dest, relative_path=source.name)
         else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, dest)
-        checksums[rel_prefix] = sha256_file(dest)
+            copy_regular_file_nofollow(source, dest)
+        copied_digest = sha256_file(dest)
+        if expected is None or copied_digest != expected:
+            raise SourceIntegrityError(
+                f"source changed while preserved payload {source.name!r} was being copied",
+                cause=vocab.CAUSE_RUNTIME_ERROR,
+                mitigation="rerun migration against a stable source",
+            )
+        checksums[rel_prefix] = copied_digest
         return checksums
 
-    for src_file in sorted(path for path in source.rglob("*") if path.is_file()):
-        rel = src_file.relative_to(source).as_posix()
+    for rel, (size, _mtime, expected) in snapshot.entries.items():
+        if size == -1:
+            continue
+        if size < 0:
+            raise UnsupportedInput(
+                f"source contains an unsupported filesystem node at {rel!r}",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="replace unreadable, symlinked, or special source entries before migration",
+            )
+        src_file = source / rel
         dst_file = dest / rel
         if is_n4a_bundle_name(src_file.name):
             _copy_recursive_n4a_archive(src_file, dst_file, relative_path=rel)
         else:
-            dst_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dst_file)
-        checksums[f"{rel_prefix}/{rel}"] = sha256_file(dst_file)
+            copy_regular_file_nofollow(src_file, dst_file)
+        copied_digest = sha256_file(dst_file)
+        if expected is None or copied_digest != expected:
+            raise SourceIntegrityError(
+                f"source changed while preserved payload {rel!r} was being copied",
+                cause=vocab.CAUSE_RUNTIME_ERROR,
+                mitigation="rerun migration against a stable source",
+            )
+        checksums[f"{rel_prefix}/{rel}"] = copied_digest
     return checksums
 
 
@@ -1534,11 +1680,8 @@ def _copy_preserved_detected_artifact(
                 if Path(name).is_absolute() or ".." in Path(name).parts:
                     continue
                 source = input_path / name
-                if not source.is_file():
-                    continue
                 dest = dest_root / name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, dest)
+                copy_regular_file_nofollow(source, dest)
                 checksums[f"{rel}/{name}"] = sha256_file(dest)
             return rel, checksums
 
@@ -1786,6 +1929,109 @@ def migrate(
     trusted_load_joblib: bool = False,
     tool_version: str,
 ) -> ExitCode:
+    """Convert a legacy source through one private, no-follow source stage.
+
+    The command resolves only the user-supplied root symlink.  It then guards
+    that original path for integrity while every detector, preview reader,
+    transform, and preservation copy consumes the private materialization.
+    This prevents a later descendant path substitution from becoming parser or
+    payload input while retaining the original path in durable contracts.
+    """
+    source_path = realpath(input_path)
+    assert_safe_source_tree(source_path)
+    assert_disjoint(source_path, output, source_is_canonical=True)
+    if resume:
+        # A completed output is already an attested read-only no-op.  Do not
+        # require a second source-sized temporary copy merely to compare its
+        # source binding: capture the same fingerprint descriptor-relatively
+        # and hold the original source under the no-follow integrity guard
+        # while validating the output contracts.
+        _validate_migrate_options(
+            target=target,
+            checksums_algo=checksums_algo,
+            dry_run=dry_run,
+            strict=strict,
+            copy_only=copy_only,
+            resume=resume,
+            trusted_load_joblib=trusted_load_joblib,
+        )
+        manifest_path, report_path, id_map_path, unsupported_report_path = _prepare_migration_contract_paths(
+            source_path=source_path,
+            output=output,
+            manifest_path=manifest_path,
+            report_path=report_path,
+            id_map_path=id_map_path,
+            unsupported_report_path=unsupported_report_path,
+            dry_run=dry_run,
+        )
+        source_snapshot = snapshot_tree_nofollow(source_path)
+        source_fingerprint = _source_fingerprint_from_snapshot(source_snapshot)
+        with source_guard_nofollow(source_path, before=source_snapshot):
+            return _resume_completed_migration(
+                source_path,
+                output,
+                target=target,
+                source_fingerprint=source_fingerprint,
+                strict=strict,
+                copy_only=copy_only,
+                manifest_path=manifest_path,
+                report_path=report_path,
+                id_map_path=id_map_path,
+                unsupported_report_path=unsupported_report_path,
+            )
+    output_was_missing = not output.exists()
+    try:
+        with materialized_source_tree_nofollow(
+            source_path, forbidden_paths=(output,), source_is_canonical=True
+        ) as staged_source, source_guard_nofollow(source_path, before=staged_source.source_snapshot):
+            return _migrate_from_materialized_source(
+                staged_source.path,
+                source_path=source_path,
+                source_snapshot=staged_source.source_snapshot,
+                output=output,
+                target=target,
+                manifest_path=manifest_path,
+                report_path=report_path,
+                id_map_path=id_map_path,
+                unsupported_report_path=unsupported_report_path,
+                checksums_algo=checksums_algo,
+                dry_run=dry_run,
+                verify=verify,
+                strict=strict,
+                copy_only=copy_only,
+                resume=resume,
+                trusted_load_joblib=trusted_load_joblib,
+                tool_version=tool_version,
+            )
+    except SourceIntegrityError:
+        # The stage has already prevented substituted bytes from reaching an
+        # output.  Preserve the existing no-publication behavior if the
+        # original integrity guard nevertheless trips after a successful run.
+        if output_was_missing and output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+        raise
+
+
+def _migrate_from_materialized_source(
+    input_path: Path,
+    *,
+    source_path: Path,
+    source_snapshot: TreeSnapshot,
+    output: Path,
+    target: str,
+    manifest_path: Path | None = None,
+    report_path: Path | None = None,
+    id_map_path: Path | None = None,
+    unsupported_report_path: Path | None = None,
+    checksums_algo: str = "sha256",
+    dry_run: bool = False,
+    verify: bool = False,
+    strict: bool = False,
+    copy_only: bool = False,
+    resume: bool = False,
+    trusted_load_joblib: bool = False,
+    tool_version: str,
+) -> ExitCode:
     """Convert a legacy source into a fresh ``--output`` (no-in-place, one-way).
 
     Non-lowerable recognized artifacts are preserved opaque in best-effort
@@ -1793,49 +2039,23 @@ def migrate(
     ``--resume`` is only a verified, read-only no-op for a completed output.
     """
     # --- Pre-flight: target + path policy (no writes yet) ------------------
-    if target == vocab.TARGET_NATIVE_RESULTS_V1:
-        raise UnsupportedInput(
-            "Phase-2 target 'native-results-v1' is gated on LOCK-REL + dag-ml V1 schema + DML-008",
-            cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
-            mitigation="use --target nirs4all-workspace-v2 (Phase 1)",
-        )
-    if target != vocab.TARGET_WORKSPACE_V2:
-        raise UnsupportedInput(
-            f"unknown --target {target!r}",
-            cause=vocab.CAUSE_INVALID_REQUEST,
-            mitigation=f"use --target {vocab.TARGET_WORKSPACE_V2}",
-        )
-    if checksums_algo != "sha256":
-        raise UnsupportedInput(
-            f"unsupported --checksums {checksums_algo!r}",
-            cause=vocab.CAUSE_INVALID_REQUEST,
-            mitigation="only sha256 is supported",
-        )
-    if trusted_load_joblib:
-        raise UnsupportedInput(
-            "--trusted-load-joblib is reserved for the schema-transform engine and is not implemented in this scaffold",
-            cause=vocab.CAUSE_UNSUPPORTED_CAPABILITY,
-            mitigation="omit --trusted-load-joblib; dry-run/copy-only never execute joblib payloads",
-        )
-    if strict and (dry_run or copy_only):
-        raise UnsupportedInput(
-            "--strict only applies to schema transforms; it has no effect with --dry-run or --copy-only",
-            cause=vocab.CAUSE_INVALID_REQUEST,
-            mitigation="omit --strict for dry-run/copy-only, or wait for the schema-transform engine",
-        )
-    if resume and dry_run:
-        raise UnsupportedInput(
-            "--resume is only available for an already completed output, not --dry-run",
-            cause=vocab.CAUSE_INVALID_REQUEST,
-            mitigation="omit --resume for a dry-run, or use --resume alone to attest an existing output",
-        )
+    _validate_migrate_options(
+        target=target,
+        checksums_algo=checksums_algo,
+        dry_run=dry_run,
+        strict=strict,
+        copy_only=copy_only,
+        resume=resume,
+        trusted_load_joblib=trusted_load_joblib,
+    )
 
-    # Resolve a user-supplied source symlink once at the command boundary.
-    # N4A descriptors remain opened with O_NOFOLLOW below, now against that
-    # stable target path rather than the user-facing symlink itself.
+    # ``input_path`` is the private materialization.  Keep policy checks and
+    # durable contracts bound to the canonical user source instead.
     input_path = realpath(input_path)
-    assert_disjoint(input_path, output)
-    manifest_path, report_path, id_map_path, unsupported_report_path = _resolve_contract_paths(
+    assert_safe_source_tree(input_path)
+    assert_disjoint(source_path, output, source_is_canonical=True)
+    manifest_path, report_path, id_map_path, unsupported_report_path = _prepare_migration_contract_paths(
+        source_path=source_path,
         output=output,
         manifest_path=manifest_path,
         report_path=report_path,
@@ -1843,26 +2063,23 @@ def migrate(
         unsupported_report_path=unsupported_report_path,
         dry_run=dry_run,
     )
-    for explicit in (manifest_path, report_path, id_map_path, unsupported_report_path):
-        if explicit is not None:
-            assert_path_outside_source(input_path, explicit)
-    if not dry_run:
-        _require_default_internal_contract_paths(
-            output,
-            manifest_path=manifest_path,
-            report_path=report_path,
-            id_map_path=id_map_path,
-            unsupported_report_path=unsupported_report_path,
-        )
 
     # --- Detection + forward-version refusal (still no writes) -------------
     with source_guard(input_path):
-        detection = detect_sources(input_path)
+        assert_safe_source_tree(input_path)
+        detection = detect_sources(input_path, allow_root_symlink=False)
         initial_snapshot = snapshot_tree(input_path)
-        source_fingerprint = _source_fingerprint_from_snapshot(initial_snapshot)
+        staged_fingerprint = _source_fingerprint_from_snapshot(initial_snapshot)
+        source_fingerprint = _source_fingerprint_from_snapshot(source_snapshot)
+        if staged_fingerprint != source_fingerprint:
+            raise SourceIntegrityError(
+                "private source stage does not match its descriptor-bound source snapshot",
+                cause=vocab.CAUSE_RUNTIME_ERROR,
+                mitigation="rerun migration against a stable source",
+            )
     if not detection.has_recognized and not dry_run:
         raise UnsupportedInput(
-            f"no known legacy artifact found at {input_path}",
+            f"no known legacy artifact found at {source_path}",
             cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
             mitigation="run 'nirs4all-tools legacy inspect' to see what was detected",
         )
@@ -1880,10 +2097,12 @@ def migrate(
         if copy_only and not resume:
             _assert_copy_only_source_paths_are_portable(initial_snapshot)
         if resume:
+            assert_safe_source_tree(input_path)
             with source_guard(input_path):
+                assert_safe_source_tree(input_path)
                 _assert_source_fingerprint_matches(input_path, source_fingerprint)
                 return _resume_completed_migration(
-                    input_path,
+                    source_path,
                     output,
                     target=target,
                     source_fingerprint=source_fingerprint,
@@ -1900,7 +2119,7 @@ def migrate(
     manifest = contracts.build_manifest(
         tool_version=tool_version,
         support_window=SUPPORT_WINDOW,
-        source_path=str(realpath(input_path)),
+        source_path=str(source_path),
         source_fingerprint=source_fingerprint,
         source_kinds=detection.kinds,
         detected_versions=detection.detected_versions,
@@ -1917,7 +2136,9 @@ def migrate(
     )
 
     # --- Execute under the whole-source-tree integrity guard --------------
+    assert_safe_source_tree(input_path)
     with source_guard(input_path):
+        assert_safe_source_tree(input_path)
         if dry_run:
             detection = _refresh_dry_run_detection(input_path, manifest, report)
         else:
@@ -2748,8 +2969,7 @@ def _run_legacy_runs_preview_transform(
             rel = f"{_PRESERVED_DIRNAME}/{KIND_FS_RUNS_LEGACY}/{preview.prediction_file}"
             source = input_path / preview.prediction_file
             dest = output / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, dest)
+            copy_regular_file_nofollow(source, dest)
             artifact_checksums[rel] = sha256_file(dest)
             payload_inventory.append(
                 {

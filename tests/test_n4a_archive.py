@@ -114,6 +114,19 @@ def test_inspect_n4a_archive_accepts_safe_opaque_zip(tmp_path: Path) -> None:
     assert len(inspection.content_sha256) == len("sha256:") + 64
 
 
+def test_inspect_n4a_archive_keeps_portable_fallback_without_posix_nofollow_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _write_bundle(tmp_path / "safe.n4a", _valid_members())
+    monkeypatch.delattr(n4a_archive.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.delattr(n4a_archive.os, "O_DIRECTORY", raising=False)
+
+    inspection = inspect_n4a_archive(archive)
+
+    assert inspection.bundle_format_version == "1.0"
+
+
 def test_copy_validated_n4a_archive_keeps_the_validated_bytes_and_version(tmp_path: Path) -> None:
     archive = _write_bundle(tmp_path / "safe.n4a", _valid_members(("artifacts/step.joblib", b"opaque")))
     copied = tmp_path / "output" / "safe.n4a"
