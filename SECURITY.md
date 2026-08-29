@@ -9,7 +9,10 @@ Security-relevant properties:
 
 - **Untrusted input surface.** SQLite / ZIP / JSON / YAML / Parquet parsing. A crafted artifact must
   fail **closed** with a clean error — never a path-traversal write, unbounded allocation, or code
-  execution. `.n4a` ZIP extraction must reject zip-slip / absolute / symlink members.
+  execution. Before an opaque `.n4a` copy, the tool bounds archive and central-directory metadata
+  before ZIP enumeration, rejects zip-slip / absolute / backslash / symlink / special / encrypted
+  members and portable-name collisions, and bounds member, total-expansion, compression-ratio, and
+  manifest sizes. The archive is never extracted or deserialized.
 - **No-in-place safety.** Migration never mutates the source; it writes a fresh output and preserves
   the raw legacy rows as **checksummed JSONL audit provenance**, after a strict hash/schema preflight.
 - **No secrets, no network.** Purely local file transformation.

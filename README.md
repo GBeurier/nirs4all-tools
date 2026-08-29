@@ -108,8 +108,13 @@ Current schema-transform support is intentionally narrow:
   root and `run_id`, `pipeline_id`, dataset, model, and preprocessing metadata
   match; the manifest tree and referenced prediction payload remain
   checksummed under `preserved/`;
-- `.n4a`, `.n4a.py`, and non-lowerable `native-results-v1` artifacts are preserved as opaque
-  checksummed payloads under `preserved/` with an empty workspace-v2 store;
+- a `.n4a` is preserved only after a bounded structural ZIP preflight: one
+  finite JSON-object `manifest.json`, portable relative member names, no
+  encrypted/symlink/special members, no normalization collisions, and explicit
+  archive/member/expansion limits. It is copied opaque under `preserved/` and
+  is never extracted, deserialized, or made predictive; `.n4a.py` and
+  non-lowerable `native-results-v1` artifacts remain opaque checksummed payloads
+  with an empty workspace-v2 store;
 - non-lowerable DuckDB variants, legacy `runs/` trees outside the
   single-manifest preview, incomplete or mixed loose prediction files, and
   already-v2 SQLite stores are preserved opaque by default in best-effort
@@ -128,7 +133,7 @@ Current schema-transform support is intentionally narrow:
 |------|---------|
 | `0`  | success, no warnings |
 | `10` | migrated with warnings (best-effort preserved opaque / non-fatal skips) |
-| `20` | unsupported input (unknown / forward-version source, or strict unsupported item) |
+| `20` | unsupported input (unknown, unsafe archive, forward-version source, or strict unsupported item) |
 | `30` | verification failed |
 | `40` | refused by policy (in-place / aliased output, non-empty output without `--resume`) |
 | `70` | internal error (incl. source-tree integrity assertion failure) |

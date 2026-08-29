@@ -43,7 +43,7 @@ from .duckdb_workspace import (
     lower_duckdb_workspace_preview,
     runtime_array_records_from_duckdb_workspace,
 )
-from .errors import UnsupportedInput, VerificationFailed
+from .errors import SourceIntegrityError, UnsupportedInput, VerificationFailed
 from .exit_codes import ExitCode
 from .legacy_runs import (
     LEGACY_RUNS_PREVIEW_VERSION,
@@ -58,6 +58,7 @@ from .loose_predictions import (
     lower_loose_predictions_preview,
     runtime_array_records_from_loose_predictions,
 )
+from .n4a_archive import N4aArchiveRefusal, copy_validated_n4a_archive, inspect_n4a_archive
 from .native_results import (
     NativeResultsPreview,
     load_native_results_preview,
@@ -65,6 +66,7 @@ from .native_results import (
     runtime_array_records_from_native_results,
 )
 from .policy import (
+    TreeSnapshot,
     assert_disjoint,
     assert_output_available,
     assert_path_outside_source,
@@ -179,7 +181,11 @@ def _contract_exclude_names(*paths: Path | None) -> set[str]:
 
 def _source_fingerprint(source: Path) -> str:
     """Return a stable content fingerprint for the source tree or bundle file."""
-    snapshot = snapshot_tree(source)
+    return _source_fingerprint_from_snapshot(snapshot_tree(source))
+
+
+def _source_fingerprint_from_snapshot(snapshot: TreeSnapshot) -> str:
+    """Return the durable source fingerprint already represented by one snapshot."""
     root = Path(snapshot.root)
     entries: list[dict[str, Any]] = []
     if root.is_file():
@@ -197,6 +203,50 @@ def _source_fingerprint(source: Path) -> str:
     return sha256_bytes(payload)
 
 
+def _assert_source_fingerprint_matches(source: Path, expected: str) -> None:
+    """Refuse output creation if the source changed after initial detection."""
+    if _source_fingerprint(source) != expected:
+        raise SourceIntegrityError(
+            "source changed after detection and before migration output was created",
+            cause=vocab.CAUSE_RUNTIME_ERROR,
+            mitigation="rerun migration against a stable source; the output is bound to its initial source snapshot",
+        )
+
+
+def _expected_n4a_content_digest(artifact: DetectedArtifact) -> str:
+    """Return the detector-bound byte digest required for an opaque N4A copy."""
+    preflight = artifact.details.get("archive_preflight")
+    digest = preflight.get("validated_content_sha256") if isinstance(preflight, dict) else None
+    if not isinstance(digest, str):
+        raise SourceIntegrityError(
+            f".n4a archive {artifact.path!r} lacks its initial content digest binding",
+            cause=vocab.CAUSE_RUNTIME_ERROR,
+            mitigation="rerun migration against a stable source archive",
+        )
+    return digest
+
+
+def _refresh_dry_run_detection(
+    input_path: Path,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+) -> DetectionResult:
+    """Bind a dry-run report to the source visible in its execution guard.
+
+    Dry-runs intentionally report unsafe and forward inputs instead of raising
+    before writing their external report.  A source may nevertheless change
+    after the initial read-only detection, so refresh all recorded source
+    facts under the second integrity guard rather than report stale facts.
+    """
+    detection = detect_sources(input_path)
+    manifest["source"]["fingerprint"] = _source_fingerprint(input_path)
+    manifest["source"]["kinds"] = detection.kinds
+    manifest["source"]["detected_versions"] = detection.detected_versions
+    manifest["input_inventory"] = [_inventory_entry(art) for art in detection.artifacts]
+    report["source_summary"]["kinds"] = detection.kinds
+    return detection
+
+
 def _inventory_entry(art: DetectedArtifact) -> dict[str, Any]:
     details = dict(art.details)
     discovered_manifests = details.pop("discovered_manifests", [])
@@ -206,6 +256,8 @@ def _inventory_entry(art: DetectedArtifact) -> dict[str, Any]:
     if art.source_kind == KIND_NATIVE_RESULTS_V1:
         manifest = "manifest.json" if art.path == "." else f"{art.path}/manifest.json"
         discovered_manifests = [manifest]
+    is_opaque_bundle = art.source_kind in {KIND_N4A_BUNDLE, KIND_N4A_PY_BUNDLE}
+    preserved_opaque = art.supported and is_opaque_bundle and not art.forward_version
 
     entry: dict[str, Any] = {
         "path": art.path,
@@ -215,7 +267,7 @@ def _inventory_entry(art: DetectedArtifact) -> dict[str, Any]:
         "row_counts": details.pop("row_counts", {}),
         "discovered_manifests": discovered_manifests,
         "discovered_bundles": discovered_bundles,
-        "preserved_opaque": art.source_kind in {KIND_N4A_BUNDLE, KIND_N4A_PY_BUNDLE} and not art.forward_version,
+        "preserved_opaque": preserved_opaque,
         "supported": art.supported,
         "forward_version": art.forward_version,
         "note": art.note,
@@ -226,11 +278,15 @@ def _inventory_entry(art: DetectedArtifact) -> dict[str, Any]:
 
 
 def _render_text(detection: DetectionResult, status: str) -> str:
+    def display(value: object) -> str:
+        """Escape filesystem and manifest values before writing to a terminal."""
+        return ascii(str(value))
+
     lines = [
         "nirs4all-tools — legacy inspect",
-        f"source : {detection.root}",
+        f"source : {display(detection.root)}",
         f"status : {status}",
-        f"kinds  : {', '.join(detection.kinds) or '(none)'}",
+        f"kinds  : {', '.join(display(kind) for kind in detection.kinds) or '(none)'}",
         "artifacts:",
     ]
     for art in detection.artifacts:
@@ -240,8 +296,11 @@ def _render_text(detection: DetectionResult, status: str) -> str:
         if art.forward_version:
             flags.append("FORWARD-VERSION")
         suffix = f"  [{' '.join(flags)}]" if flags else ""
-        note = f"  — {art.note}" if art.note else ""
-        lines.append(f"  - {art.path}  ({art.source_kind})  version={art.detected_version}{suffix}{note}")
+        note = f"  — {display(art.note)}" if art.note else ""
+        lines.append(
+            f"  - {display(art.path)}  ({display(art.source_kind)})  "
+            f"version={display(art.detected_version)}{suffix}{note}"
+        )
     return "\n".join(lines)
 
 
@@ -258,7 +317,8 @@ def inspect(input_path: Path, *, fmt: str = "json", report_path: Path | None = N
     with source_guard(input_path):
         detection = detect_sources(input_path)
 
-    status = vocab.STATUS_SUCCESS if detection.has_recognized else vocab.STATUS_UNSUPPORTED_INPUT
+    supported = detection.has_recognized and all(artifact.supported for artifact in detection.artifacts)
+    status = vocab.STATUS_SUCCESS if supported else vocab.STATUS_UNSUPPORTED_INPUT
     document: dict[str, Any] = {
         "tool": "nirs4all-tools",
         "command": "legacy inspect",
@@ -277,7 +337,7 @@ def inspect(input_path: Path, *, fmt: str = "json", report_path: Path | None = N
     else:
         print(_render_text(detection, status))
 
-    return ExitCode.SUCCESS if detection.has_recognized else ExitCode.UNSUPPORTED_INPUT
+    return ExitCode.SUCCESS if supported else ExitCode.UNSUPPORTED_INPUT
 
 
 def _resolve_contract_paths(
@@ -303,7 +363,13 @@ def _resolve_contract_paths(
     return manifest, report, id_map, unsupported
 
 
-def _copy_only(source: Path, output: Path, manifest: dict[str, Any]) -> dict[str, str]:
+def _copy_only(
+    source: Path,
+    output: Path,
+    manifest: dict[str, Any],
+    *,
+    n4a_artifacts: list[DetectedArtifact],
+) -> dict[str, str]:
     """Faithfully copy the source tree into ``output/payload`` with checksums.
 
     No schema interpretation happens — this is the ``--copy-only`` safety hatch
@@ -313,12 +379,25 @@ def _copy_only(source: Path, output: Path, manifest: dict[str, Any]) -> dict[str
     checksums: dict[str, str] = {}
     snapshot = snapshot_tree(source)
     src_real = Path(snapshot.root)
+    n4a_by_path = {artifact.path: artifact for artifact in n4a_artifacts}
     file_count = 0
     if src_real.is_file():
         dest = payload_root / src_real.name
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_real, dest)
         key = f"{_PAYLOAD_DIRNAME}/{src_real.name}"
+        artifact = n4a_by_path.get(".")
+        if artifact is not None:
+            try:
+                copy_validated_n4a_archive(
+                    src_real,
+                    dest,
+                    expected_bundle_format_version=artifact.detected_version,
+                    expected_content_sha256=_expected_n4a_content_digest(artifact),
+                )
+            except N4aArchiveRefusal as refusal:
+                raise _n4a_archive_refusal(artifact, refusal) from refusal
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_real, dest)
         checksums[key] = sha256_file(dest)
         file_count = 1
     else:
@@ -327,8 +406,20 @@ def _copy_only(source: Path, output: Path, manifest: dict[str, Any]) -> dict[str
                 continue
             src_file = src_real / rel
             dest = payload_root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dest)
+            artifact = n4a_by_path.get(rel)
+            if artifact is not None:
+                try:
+                    copy_validated_n4a_archive(
+                        src_file,
+                        dest,
+                        expected_bundle_format_version=artifact.detected_version,
+                        expected_content_sha256=_expected_n4a_content_digest(artifact),
+                    )
+                except N4aArchiveRefusal as refusal:
+                    raise _n4a_archive_refusal(artifact, refusal) from refusal
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dest)
             checksums[f"{_PAYLOAD_DIRNAME}/{rel}"] = sha256_file(dest)
             file_count += 1
     manifest["checksums"] = checksums
@@ -781,6 +872,29 @@ def _artifact_source_path(input_path: Path, art: DetectedArtifact) -> Path:
     return input_path / art.path
 
 
+def _n4a_archive_refusal(art: DetectedArtifact, refusal: N4aArchiveRefusal) -> UnsupportedInput:
+    """Map an unsafe opaque bundle to the stable public migration refusal."""
+    return UnsupportedInput(
+        f"unsafe .n4a archive {art.path!r}: {refusal}",
+        cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+        mitigation="obtain a structurally safe archive; nirs4all-tools never extracts or executes .n4a payloads",
+    )
+
+
+def _refuse_unsupported_detected_n4a_archives(detection: DetectionResult) -> None:
+    """Surface an initial detector refusal without needlessly re-scanning payloads."""
+    for art in detection.artifacts:
+        if art.source_kind != KIND_N4A_BUNDLE or art.supported:
+            continue
+        preflight = art.details.get("archive_preflight")
+        reason = preflight.get("reason") if isinstance(preflight, dict) else art.note
+        raise UnsupportedInput(
+            f"unsafe .n4a archive {art.path!r}: {reason or 'archive safety preflight refused'}",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation="obtain a structurally safe archive; nirs4all-tools never extracts or executes .n4a payloads",
+        )
+
+
 def _artifact_preserved_rel(input_path: Path, art: DetectedArtifact) -> str:
     """Stable destination under ``preserved/`` for one opaque artifact."""
     name = (input_path.name or "root") if art.path == "." else art.path
@@ -849,6 +963,17 @@ def _copy_preserved_detected_artifact(
             return rel, checksums
 
     source = _artifact_source_path(input_path, art)
+    if art.source_kind == KIND_N4A_BUNDLE:
+        try:
+            copy_validated_n4a_archive(
+                source,
+                output / rel,
+                expected_bundle_format_version=art.detected_version,
+                expected_content_sha256=_expected_n4a_content_digest(art),
+            )
+        except N4aArchiveRefusal as refusal:
+            raise _n4a_archive_refusal(art, refusal) from refusal
+        return rel, {rel: sha256_file(output / rel)}
     return rel, _copy_preserved_artifact(source, output / rel, rel)
 
 
@@ -899,7 +1024,7 @@ def _record_preserved_artifacts(
 
 def _preservable_opaque_artifacts(detection: DetectionResult) -> list[DetectedArtifact]:
     """Return supported opaque artifacts that can be preserved in best-effort mode."""
-    return [art for art in detection.artifacts if art.source_kind in _OPAQUE_PRESERVABLE_KINDS]
+    return [art for art in detection.artifacts if art.supported and art.source_kind in _OPAQUE_PRESERVABLE_KINDS]
 
 
 def _legacy_runs_lowering_artifacts(
@@ -952,8 +1077,44 @@ def _dry_run_unsupported_items(input_path: Path, detection: DetectionResult) -> 
     legacy_runs_loose = legacy_runs_artifacts[1] if legacy_runs_artifacts is not None else None
 
     for art in detection.artifacts:
+        if art.forward_version:
+            unsupported.append(
+                _unsupported_entry(
+                    art,
+                    reason=(
+                        "source declares a version newer than this tool supports: "
+                        f"{art.path}({art.detected_version})"
+                    ),
+                    disposition="refused",
+                    cause=vocab.CAUSE_FORWARD_VERSION,
+                )
+            )
+            continue
+        if not art.supported:
+            unsupported.append(
+                _unsupported_entry(
+                    art,
+                    reason=art.note or "source is not supported by this migration profile",
+                    disposition="refused",
+                    cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                )
+            )
+            continue
         if art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS:
             continue
+        if art.source_kind == KIND_N4A_BUNDLE:
+            try:
+                inspect_n4a_archive(_artifact_source_path(input_path, art))
+            except N4aArchiveRefusal as refusal:
+                unsupported.append(
+                    _unsupported_entry(
+                        art,
+                        reason=str(refusal),
+                        disposition="refused",
+                        cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                    )
+                )
+                continue
         if art.source_kind == KIND_DUCKDB_WORKSPACE and standalone_duckdb:
             try:
                 preview = load_duckdb_workspace_preview(_artifact_source_path(input_path, art))
@@ -1107,15 +1268,16 @@ def migrate(
     # --- Detection + forward-version refusal (still no writes) -------------
     with source_guard(input_path):
         detection = detect_sources(input_path)
-        source_fingerprint = _source_fingerprint(input_path)
-    if not detection.has_recognized:
+        initial_snapshot = snapshot_tree(input_path)
+        source_fingerprint = _source_fingerprint_from_snapshot(initial_snapshot)
+    if not detection.has_recognized and not dry_run:
         raise UnsupportedInput(
             f"no known legacy artifact found at {input_path}",
             cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
             mitigation="run 'nirs4all-tools legacy inspect' to see what was detected",
         )
     forward = detection.forward_version_artifacts
-    if forward:
+    if forward and not dry_run:
         names = ", ".join(f"{a.path}({a.detected_version})" for a in forward)
         raise UnsupportedInput(
             f"source declares a version newer than this tool supports: {names}",
@@ -1124,6 +1286,7 @@ def migrate(
         )
 
     if not dry_run:
+        _refuse_unsupported_detected_n4a_archives(detection)
         assert_output_available(output, resume=resume)
 
     # --- Build contract skeletons -----------------------------------------
@@ -1148,6 +1311,10 @@ def migrate(
     # --- Execute under the whole-source-tree integrity guard --------------
     with source_guard(input_path):
         if dry_run:
+            detection = _refresh_dry_run_detection(input_path, manifest, report)
+        else:
+            _assert_source_fingerprint_matches(input_path, source_fingerprint)
+        if dry_run:
             return _run_dry_run(
                 input_path,
                 detection,
@@ -1168,6 +1335,7 @@ def migrate(
                 report_path,
                 id_map_path,
                 unsupported_report_path,
+                [art for art in detection.artifacts if art.source_kind == KIND_N4A_BUNDLE],
                 verify_after=verify,
             )
         if any(art.source_kind == KIND_SQLITE_WORKSPACE_LEGACY_ARRAYS for art in detection.artifacts):
@@ -1446,9 +1614,18 @@ def _run_dry_run(
     unsupported = _dry_run_unsupported_items(input_path, detection)
     manifest["unsupported"] = unsupported
     manifest["warnings"].append("dry-run: no output store written")
-    report["status"] = vocab.STATUS_MIGRATED_WITH_WARNINGS if unsupported else vocab.STATUS_SUCCESS
+    refused = [item for item in unsupported if item["disposition"] == "refused"]
+    preserved = [item for item in unsupported if item["disposition"] in {"preserved", "would_preserve"}]
+    report["status"] = (
+        vocab.STATUS_UNSUPPORTED_INPUT
+        if refused
+        else vocab.STATUS_MIGRATED_WITH_WARNINGS
+        if unsupported
+        else vocab.STATUS_SUCCESS
+    )
     report["warnings"].append("dry-run: detection + mapping simulation only")
-    report["unsupported_counts"]["preserved"] = len(unsupported)
+    report["unsupported_counts"]["preserved"] = len(preserved)
+    report["unsupported_counts"]["refused"] = len(refused)
     report["target_summary"]["path"] = str(output)
     report["recommended_next_command"] = (
         f"nirs4all-tools legacy migrate <input> --output {output} --target {vocab.TARGET_WORKSPACE_V2}"
@@ -1468,10 +1645,11 @@ def _run_dry_run(
         "kinds": detection.kinds,
         "artifacts": len(detection.artifacts),
         "unsupported": len(unsupported),
-        "would_preserve_opaque": len(unsupported),
+        "would_preserve_opaque": len(preserved),
+        "would_refuse": len(refused),
     }
     print(json.dumps(preview, indent=2, sort_keys=True))
-    return ExitCode.SUCCESS
+    return ExitCode.UNSUPPORTED_INPUT if refused else ExitCode.SUCCESS
 
 
 def _run_copy_only(
@@ -1483,6 +1661,7 @@ def _run_copy_only(
     report_path: Path | None,
     id_map_path: Path | None,
     unsupported_report_path: Path | None,
+    n4a_artifacts: list[DetectedArtifact],
     *,
     verify_after: bool = False,
 ) -> ExitCode:
@@ -1490,7 +1669,7 @@ def _run_copy_only(
     created = not output.exists()
     try:
         output.mkdir(parents=True, exist_ok=True)
-        _copy_only(input_path, output, manifest)
+        _copy_only(input_path, output, manifest, n4a_artifacts=n4a_artifacts)
         manifest["target"]["kind"] = "copy-only"
         manifest["tool"]["completed_at"] = _now_iso()
         report["status"] = vocab.STATUS_SUCCESS

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from nirs4all_tools import commands, policy, vocab
 from nirs4all_tools.checksums import sha256_file
-from nirs4all_tools.errors import PolicyRefusal, UnsupportedInput, VerificationFailed
+from nirs4all_tools.errors import PolicyRefusal, SourceIntegrityError, UnsupportedInput, VerificationFailed
 from nirs4all_tools.exit_codes import ExitCode
 
 
@@ -34,6 +36,14 @@ def _mark_native_results_as_multidimensional(path: Path) -> None:
     pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), predictions)
 
 
+def _write_unsafe_n4a_bundle(path: Path) -> Path:
+    """Create a deliberately traversal-bearing archive without extracting it."""
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", "{}")
+        archive.writestr("../escape", "never extracted")
+    return path
+
+
 # --- inspect ---------------------------------------------------------------
 def test_inspect_recognized_returns_success(sqlite_v2_workspace: Path, capsys: pytest.CaptureFixture[str]) -> None:
     code = commands.inspect(sqlite_v2_workspace, fmt="json")
@@ -54,6 +64,34 @@ def test_inspect_does_not_touch_source(sqlite_v2_workspace: Path) -> None:
 def test_inspect_refuses_report_inside_source(sqlite_v2_workspace: Path) -> None:
     with pytest.raises(PolicyRefusal):
         commands.inspect(sqlite_v2_workspace, report_path=sqlite_v2_workspace / "r.json")
+
+
+def test_inspect_unsafe_n4a_reports_unsupported_input(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    source = _write_unsafe_n4a_bundle(tmp_path / "unsafe.n4a")
+
+    code = commands.inspect(source, fmt="json")
+
+    assert code == ExitCode.UNSUPPORTED_INPUT
+    document = json.loads(capsys.readouterr().out)
+    assert document["status"] == vocab.STATUS_UNSUPPORTED_INPUT
+    artifact = document["input_inventory"][0]
+    assert artifact["supported"] is False
+    assert artifact["preserved_opaque"] is False
+    assert artifact["details"]["archive_preflight"]["rule"] == "unsafe_member_path"
+
+
+def test_inspect_refuses_an_n4a_manifest_with_an_isolated_surrogate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "surrogate.n4a"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("manifest.json", b'{"bundle_format_version":"\\ud800"}')
+
+    code = commands.inspect(source, fmt="text")
+
+    assert code == ExitCode.UNSUPPORTED_INPUT
+    assert "UNSUPPORTED" in capsys.readouterr().out
 
 
 # --- migrate: pre-flight refusals -----------------------------------------
@@ -193,6 +231,81 @@ def test_migrate_dry_run_writes_unsupported_report_for_legacy_workspace(
     assert {item["disposition"] for item in unsupported["unsupported"]} == {"would_preserve"}
     preview_manifest = json.loads(manifest.read_text(encoding="utf-8"))
     assert preview_manifest["unsupported"] == unsupported["unsupported"]
+
+
+def test_migrate_unsafe_n4a_dry_run_reports_refusal_without_output(tmp_path: Path) -> None:
+    source = _write_unsafe_n4a_bundle(tmp_path / "unsafe.n4a")
+    out = tmp_path / "out"
+    manifest_path = tmp_path / "manifest.json"
+    report_path = tmp_path / "report.json"
+    unsupported_path = tmp_path / "unsupported.json"
+
+    def run() -> None:
+        code = commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            dry_run=True,
+            manifest_path=manifest_path,
+            report_path=report_path,
+            unsupported_report_path=unsupported_path,
+            tool_version="0.0.1",
+        )
+        assert code == ExitCode.UNSUPPORTED_INPUT
+
+    _unchanged(source, run)
+    assert not out.exists()
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    assert unsupported["status"] == vocab.STATUS_UNSUPPORTED_INPUT
+    assert unsupported["counts"]["refused"] == 1
+    entry = unsupported["unsupported"][0]
+    assert entry["item"] == "."
+    assert entry["source_kind"] == "n4a-bundle"
+    assert entry["disposition"] == "refused"
+    assert entry["cause"] == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "unsafe_member_path" in entry["reason"]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == vocab.STATUS_UNSUPPORTED_INPUT
+    preview_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert preview_manifest["unsupported"] == unsupported["unsupported"]
+    assert preview_manifest["input_inventory"][0]["preserved_opaque"] is False
+
+
+def test_migrate_forward_n4a_dry_run_reports_refusal_without_output(tmp_path: Path) -> None:
+    source = tmp_path / "future.n4a"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("manifest.json", '{"bundle_format_version":"2.0"}')
+    out = tmp_path / "out"
+    manifest_path = tmp_path / "manifest.json"
+    report_path = tmp_path / "report.json"
+    unsupported_path = tmp_path / "unsupported.json"
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        dry_run=True,
+        manifest_path=manifest_path,
+        report_path=report_path,
+        unsupported_report_path=unsupported_path,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.UNSUPPORTED_INPUT
+    assert not out.exists()
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    assert unsupported["status"] == vocab.STATUS_UNSUPPORTED_INPUT
+    assert unsupported["unsupported"] == [
+        {
+            "item": ".",
+            "source_kind": "n4a-bundle",
+            "reason": "source declares a version newer than this tool supports: .(2.0)",
+            "disposition": "refused",
+            "cause": vocab.CAUSE_FORWARD_VERSION,
+        }
+    ]
+    assert json.loads(report_path.read_text(encoding="utf-8"))["status"] == vocab.STATUS_UNSUPPORTED_INPUT
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["unsupported"] == unsupported["unsupported"]
 
 
 def test_migrate_native_results_dry_run_reports_lowerable_preview(
@@ -880,6 +993,227 @@ def test_migrate_n4a_bundle_preserves_opaque_best_effort(
     assert f"preserved/n4a-bundle/{n4a_bundle.name}" in manifest["checksums"]
     assert manifest["preserved_opaque"][0]["reason"] == "n4a-bundle"
     assert commands.verify(out, manifest_path=out / "migration-manifest.json") == ExitCode.SUCCESS
+
+
+def test_copy_only_n4a_bundle_copies_the_validated_archive(n4a_bundle: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+
+    code = commands.migrate(
+        n4a_bundle,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        copy_only=True,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.SUCCESS
+    assert (out / "payload" / n4a_bundle.name).read_bytes() == n4a_bundle.read_bytes()
+
+
+@pytest.mark.parametrize("copy_only", [False, True])
+def test_migrate_unsafe_n4a_refuses_before_any_output(tmp_path: Path, copy_only: bool) -> None:
+    source = _write_unsafe_n4a_bundle(tmp_path / "unsafe.n4a")
+    out = tmp_path / "out"
+
+    def run() -> None:
+        with pytest.raises(UnsupportedInput) as raised:
+            commands.migrate(
+                source,
+                output=out,
+                target=vocab.TARGET_WORKSPACE_V2,
+                copy_only=copy_only,
+                tool_version="0.0.1",
+            )
+        assert raised.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+        assert "unsafe_member_path" in raised.value.message
+
+    _unchanged(source, run)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("copy_only", [False, True])
+def test_migrate_refuses_n4a_source_mutation_after_output_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copy_only: bool,
+) -> None:
+    source = tmp_path / "model.n4a"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("manifest.json", "{}")
+    out = tmp_path / "out"
+    original_assert_output_available = commands.assert_output_available
+
+    def replace_source_after_first_preflight(output: Path, *, resume: bool) -> None:
+        _write_unsafe_n4a_bundle(source)
+        original_assert_output_available(output, resume=resume)
+
+    monkeypatch.setattr(commands, "assert_output_available", replace_source_after_first_preflight)
+
+    with pytest.raises(SourceIntegrityError):
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=copy_only,
+            tool_version="0.0.1",
+        )
+
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("copy_only", [False, True])
+def test_migrate_refuses_forward_n4a_source_mutation_after_output_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copy_only: bool,
+) -> None:
+    source = tmp_path / "model.n4a"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("manifest.json", '{"bundle_format_version":"1.0"}')
+    out = tmp_path / "out"
+    original_assert_output_available = commands.assert_output_available
+
+    def replace_source_after_first_preflight(output: Path, *, resume: bool) -> None:
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("manifest.json", '{"bundle_format_version":"2.0"}')
+        original_assert_output_available(output, resume=resume)
+
+    monkeypatch.setattr(commands, "assert_output_available", replace_source_after_first_preflight)
+
+    with pytest.raises(SourceIntegrityError):
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=copy_only,
+            tool_version="0.0.1",
+        )
+
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("copy_only", [False, True])
+def test_migrate_binds_n4a_output_to_its_initial_source_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copy_only: bool,
+) -> None:
+    source = tmp_path / "model.n4a"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("manifest.json", '{"bundle_format_version":"1.0"}')
+        archive.writestr("payload-a", "A")
+    out = tmp_path / "out"
+    original_build_manifest = commands.contracts.build_manifest
+
+    def replace_source_after_initial_detection(*args, **kwargs):
+        manifest = original_build_manifest(*args, **kwargs)
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("manifest.json", '{"bundle_format_version":"1.0"}')
+            archive.writestr("payload-b", "B")
+        return manifest
+
+    monkeypatch.setattr(commands.contracts, "build_manifest", replace_source_after_initial_detection)
+
+    with pytest.raises(SourceIntegrityError):
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=copy_only,
+            tool_version="0.0.1",
+        )
+
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("copy_only", [False, True])
+def test_migrate_binds_n4a_copy_to_its_initial_content_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copy_only: bool,
+) -> None:
+    source = tmp_path / "model.n4a"
+    alternate = tmp_path / "alternate.n4a"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("manifest.json", '{"bundle_format_version":"1.0"}')
+        archive.writestr("payload-a", "A")
+    source_bytes = source.read_bytes()
+    source_stat = source.stat()
+    with zipfile.ZipFile(alternate, "w") as archive:
+        archive.writestr("manifest.json", '{"bundle_format_version":"1.0"}')
+        archive.writestr("payload-b", "B")
+    assert len(source_bytes) == alternate.stat().st_size
+    out = tmp_path / "out"
+    original_fingerprint_check = commands._assert_source_fingerprint_matches
+    original_copy = commands.copy_validated_n4a_archive
+
+    def replace_after_fingerprint(source_path: Path, expected: str) -> None:
+        original_fingerprint_check(source_path, expected)
+        source.write_bytes(alternate.read_bytes())
+        os.utime(source, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+    def restore_after_copy_attempt(*args, **kwargs):
+        try:
+            return original_copy(*args, **kwargs)
+        finally:
+            source.write_bytes(source_bytes)
+            os.utime(source, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+    monkeypatch.setattr(commands, "_assert_source_fingerprint_matches", replace_after_fingerprint)
+    monkeypatch.setattr(commands, "copy_validated_n4a_archive", restore_after_copy_attempt)
+
+    with pytest.raises(UnsupportedInput) as raised:
+        commands.migrate(
+            source,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=copy_only,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+    assert "content digest changed" in raised.value.message
+    assert source.read_bytes() == source_bytes
+    assert not out.exists()
+
+
+def test_migrate_dry_run_refreshes_n4a_detection_after_initial_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "model.n4a"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("manifest.json", '{"bundle_format_version":"1.0"}')
+    out = tmp_path / "out"
+    manifest_path = tmp_path / "preview-manifest.json"
+    unsupported_path = tmp_path / "unsupported.json"
+    original_build_manifest = commands.contracts.build_manifest
+
+    def replace_source_after_initial_detection(*args, **kwargs):
+        manifest = original_build_manifest(*args, **kwargs)
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("manifest.json", '{"bundle_format_version":"2.0"}')
+        return manifest
+
+    monkeypatch.setattr(commands.contracts, "build_manifest", replace_source_after_initial_detection)
+
+    code = commands.migrate(
+        source,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        dry_run=True,
+        manifest_path=manifest_path,
+        unsupported_report_path=unsupported_path,
+        tool_version="0.0.1",
+    )
+
+    assert code == ExitCode.UNSUPPORTED_INPUT
+    assert not out.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source"]["detected_versions"] == {"n4a-bundle": "2.0"}
+    unsupported = json.loads(unsupported_path.read_text(encoding="utf-8"))
+    assert unsupported["unsupported"][0]["cause"] == vocab.CAUSE_FORWARD_VERSION
+    assert unsupported["unsupported"][0]["disposition"] == "refused"
 
 
 def test_migrate_refuses_inert_strict_on_copy_only(sqlite_v2_workspace: Path, tmp_path: Path) -> None:
