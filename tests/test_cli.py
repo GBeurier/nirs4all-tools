@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,19 @@ def test_inspect_unknown_returns_twenty(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
     assert main(["legacy", "inspect", str(empty), "--format", "text"]) == int(ExitCode.UNSUPPORTED_INPUT)
+
+
+def test_migrate_unsafe_n4a_returns_twenty_without_output(tmp_path: Path) -> None:
+    source = tmp_path / "unsafe.n4a"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("manifest.json", "{}")
+        archive.writestr("../escape", "never extracted")
+
+    out = tmp_path / "out"
+    code = main(["legacy", "migrate", str(source), "--output", str(out)])
+
+    assert code == int(ExitCode.UNSUPPORTED_INPUT)
+    assert not out.exists()
 
 
 def test_migrate_aliased_output_returns_forty(sqlite_v2_workspace: Path, capsys: pytest.CaptureFixture[str]) -> None:

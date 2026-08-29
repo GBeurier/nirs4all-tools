@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import zipfile
 from pathlib import Path
+
+import pytest
 
 from conftest import make_n4a_bundle
 from nirs4all_tools import detect
@@ -47,6 +51,7 @@ def test_detect_n4a_bundle_file(n4a_bundle: Path) -> None:
     art = result.artifacts[0]
     assert art.detected_version == "1.0"
     assert art.forward_version is False
+    assert art.details["archive_preflight"]["validated_content_sha256"].startswith("sha256:")
 
 
 def test_detect_forward_n4a_bundle(tmp_path: Path) -> None:
@@ -55,6 +60,55 @@ def test_detect_forward_n4a_bundle(tmp_path: Path) -> None:
     art = result.artifacts[0]
     assert art.forward_version is True
     assert art.supported is False
+
+
+def test_detect_unsafe_n4a_bundle_is_recognized_but_refused(tmp_path: Path) -> None:
+    bundle = tmp_path / "unsafe.n4a"
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.writestr("manifest.json", "{}")
+        archive.writestr("../escape", "never extracted")
+
+    result = detect.detect_sources(bundle)
+
+    art = result.artifacts[0]
+    assert art.source_kind == detect.KIND_N4A_BUNDLE
+    assert art.supported is False
+    assert art.forward_version is False
+    assert art.details["archive_preflight"]["status"] == "refused"
+    assert art.details["archive_preflight"]["rule"] == "unsafe_member_path"
+
+
+def test_detect_n4a_with_an_enormous_numeric_version_fails_closed(tmp_path: Path) -> None:
+    bundle = make_n4a_bundle(tmp_path / "huge-version.n4a", bundle_format_version="9" * 5_000)
+
+    result = detect.detect_sources(bundle)
+
+    art = result.artifacts[0]
+    assert art.forward_version is True
+    assert art.supported is False
+
+
+def test_detect_n4a_with_a_non_ascii_digit_version_does_not_crash(tmp_path: Path) -> None:
+    bundle = make_n4a_bundle(tmp_path / "unicode-version.n4a", bundle_format_version="²")
+
+    result = detect.detect_sources(bundle)
+
+    art = result.artifacts[0]
+    assert art.detected_version == "²"
+    assert art.forward_version is False
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO semantics are unavailable on this platform")
+def test_detect_direct_n4a_fifo_is_refused_without_directory_traversal(tmp_path: Path) -> None:
+    bundle = tmp_path / "untrusted.n4a"
+    os.mkfifo(bundle)
+
+    result = detect.detect_sources(bundle)
+
+    art = result.artifacts[0]
+    assert art.source_kind == detect.KIND_N4A_BUNDLE
+    assert art.supported is False
+    assert art.details["archive_preflight"]["rule"] == "invalid_zip"
 
 
 def test_detect_current_native_results(lowerable_native_results_dir: Path) -> None:

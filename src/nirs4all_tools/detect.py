@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from .n4a_archive import N4aArchiveRefusal, inspect_n4a_archive
 from .policy import read_only_sqlite_uri
 
 # --- source_kind constants (spec §4 table) ---------------------------------
@@ -101,8 +101,13 @@ def _parse_version_tuple(value: str) -> tuple[int, ...]:
     parts: list[int] = []
     for token in str(value).split("."):
         token = token.strip()
-        if not token.isdigit():
+        if not token.isascii() or not token.isdecimal():
             break
+        if len(token) > 18:
+            # A numeric component this large is necessarily newer than every
+            # supported legacy format, without asking ``int`` to allocate an
+            # attacker-controlled bignum.
+            return (10**18,)
         parts.append(int(token))
     return tuple(parts)
 
@@ -128,19 +133,6 @@ def _probe_sqlite(path: Path) -> tuple[int | None, set[str]]:
         con.close()
 
 
-def _peek_zip_manifest(path: Path) -> dict[str, Any] | None:
-    """Read ``manifest.json`` from a ``.n4a`` ZIP without extracting it."""
-    try:
-        with zipfile.ZipFile(path) as zf:
-            if "manifest.json" not in zf.namelist():
-                return None
-            with zf.open("manifest.json") as handle:
-                data: Any = json.load(handle)
-        return data if isinstance(data, dict) else None
-    except (zipfile.BadZipFile, OSError, ValueError):
-        return None
-
-
 def _read_json(path: Path) -> dict[str, Any] | None:
     """Read a JSON object, returning ``None`` on any failure."""
     try:
@@ -152,8 +144,23 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 def _detect_n4a_bundle(path: Path, rel: str) -> DetectedArtifact:
     """Classify a ``.n4a`` ZIP bundle and check its declared format version."""
-    manifest = _peek_zip_manifest(path)
-    fmt = manifest.get("bundle_format_version") if manifest else None
+    try:
+        inspection = inspect_n4a_archive(path)
+    except N4aArchiveRefusal as exc:
+        return DetectedArtifact(
+            path=rel,
+            source_kind=KIND_N4A_BUNDLE,
+            supported=False,
+            note=f"archive safety preflight refused: {exc}",
+            details={
+                "archive_preflight": {
+                    "status": "refused",
+                    "rule": exc.rule,
+                    "reason": str(exc),
+                }
+            },
+        )
+    fmt = inspection.bundle_format_version
     forward = bool(fmt) and _parse_version_tuple(str(fmt)) > SUPPORTED_BUNDLE_FORMAT_VERSION
     return DetectedArtifact(
         path=rel,
@@ -162,6 +169,16 @@ def _detect_n4a_bundle(path: Path, rel: str) -> DetectedArtifact:
         supported=not forward,
         forward_version=forward,
         note="preserved opaque; never executed" if not forward else "forward bundle_format_version",
+        details={
+            "archive_preflight": {
+                "status": "validated",
+                "archive_bytes": inspection.archive_bytes,
+                "central_directory_bytes": inspection.central_directory_bytes,
+                "member_count": inspection.member_count,
+                "total_uncompressed_bytes": inspection.total_uncompressed_bytes,
+                "validated_content_sha256": inspection.content_sha256,
+            }
+        },
     )
 
 
@@ -267,6 +284,13 @@ def detect_sources(input_path: Path) -> DetectionResult:
             result.artifacts.append(_detect_n4a_bundle(root, "."))
         else:
             result.artifacts.append(_unknown("unrecognized file"))
+        return result
+
+    if not root.is_dir():
+        if root.name.endswith(".n4a"):
+            result.artifacts.append(_detect_n4a_bundle(root, "."))
+        else:
+            result.artifacts.append(_unknown("path is neither a regular file nor a directory"))
         return result
 
     _detect_directory(root, result)
