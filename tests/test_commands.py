@@ -52,6 +52,13 @@ def _write_unsafe_n4a_bundle(path: Path) -> Path:
     return path
 
 
+def _write_forward_n4a_bundle(path: Path) -> Path:
+    """Create a structurally safe archive with an unsupported format version."""
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", '{"bundle_format_version":"2.0"}')
+    return path
+
+
 # --- inspect ---------------------------------------------------------------
 def test_inspect_recognized_returns_success(sqlite_v2_workspace: Path, capsys: pytest.CaptureFixture[str]) -> None:
     code = commands.inspect(sqlite_v2_workspace, fmt="json")
@@ -1143,6 +1150,70 @@ def test_copy_only_n4a_bundle_copies_the_validated_archive(n4a_bundle: Path, tmp
 
     assert code == ExitCode.SUCCESS
     assert (out / "payload" / n4a_bundle.name).read_bytes() == n4a_bundle.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("writer", "name", "cause", "reason"),
+    [
+        (_write_unsafe_n4a_bundle, "unsafe.n4a", vocab.CAUSE_UNSUPPORTED_SHAPE, "unsafe_member_path"),
+        (_write_forward_n4a_bundle, "future.n4a", vocab.CAUSE_FORWARD_VERSION, "version newer"),
+        (_write_unsafe_n4a_bundle, "unsafe.N4A", vocab.CAUSE_UNSUPPORTED_SHAPE, "unsafe_member_path"),
+        (_write_forward_n4a_bundle, "future.N4A", vocab.CAUSE_FORWARD_VERSION, "version newer"),
+    ],
+)
+def test_copy_only_refuses_nested_n4a_before_copying_it(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    writer,
+    name: str,
+    cause: str,
+    reason: str,
+) -> None:
+    nested = sqlite_v2_workspace / "nested"
+    nested.mkdir()
+    writer(nested / name)
+    out = tmp_path / "out"
+
+    def run() -> None:
+        with pytest.raises(UnsupportedInput) as raised:
+            commands.migrate(
+                sqlite_v2_workspace,
+                output=out,
+                target=vocab.TARGET_WORKSPACE_V2,
+                copy_only=True,
+                tool_version="0.0.1",
+            )
+        assert raised.value.cause == cause
+        assert reason in raised.value.message
+
+    _unchanged(sqlite_v2_workspace, run)
+    assert not out.exists()
+    assert not (out / "payload" / "nested" / name).exists()
+
+
+def test_opaque_native_results_preservation_refuses_nested_unsafe_n4a(
+    native_results_dir: Path,
+    tmp_path: Path,
+) -> None:
+    nested = native_results_dir / "nested"
+    nested.mkdir()
+    _write_unsafe_n4a_bundle(nested / "unsafe.n4a")
+    out = tmp_path / "out"
+
+    def run() -> None:
+        with pytest.raises(UnsupportedInput) as raised:
+            commands.migrate(
+                native_results_dir,
+                output=out,
+                target=vocab.TARGET_WORKSPACE_V2,
+                tool_version="0.0.1",
+            )
+        assert raised.value.cause == vocab.CAUSE_UNSUPPORTED_SHAPE
+        assert "unsafe_member_path" in raised.value.message
+
+    _unchanged(native_results_dir, run)
+    assert not out.exists()
+    assert not (out / "preserved" / "native-results-v1" / native_results_dir.name / "nested" / "unsafe.n4a").exists()
 
 
 @pytest.mark.parametrize("copy_only", [False, True])
