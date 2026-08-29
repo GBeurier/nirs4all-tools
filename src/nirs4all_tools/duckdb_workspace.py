@@ -2,9 +2,9 @@
 
 This module deliberately supports one closed source profile only: the six
 tables emitted by the historical ``store.duckdb`` test producer, containing a
-single run, pipeline, and chain with flat prediction arrays.  It never imports
-the runtime and opens DuckDB only in read-only mode.  Older or broader
-workspaces remain opaque rather than being partially copied.
+validated graph of runs, pipelines, chains, and flat prediction arrays.  It
+never imports the runtime and opens DuckDB only in read-only mode.  Older or
+broader workspaces remain opaque rather than being partially copied.
 """
 
 from __future__ import annotations
@@ -528,21 +528,20 @@ def _validate_unique_ids(rows: tuple[dict[str, Any], ...], *, table: str) -> Non
 
 
 def _validate_target_prediction_identities(rows: tuple[dict[str, Any], ...]) -> None:
-    """Reject collisions in the target's non-null unique prediction index."""
-    identities: set[tuple[str, str, str, str, str, int]] = set()
+    """Reject collisions in the target's logical natural prediction identity."""
+    identities: set[tuple[str, str, str, str, str, int | None]] = set()
     for prediction in rows:
         branch_id = prediction["branch_id"]
-        # SQLite unique indexes allow repeated NULLs, so only the non-null
-        # branch identities can collide in the target index.
-        if branch_id is None:
-            continue
+        normalized_branch_id = (
+            None if branch_id is None else _required_nonnegative_int(prediction, table="predictions", field="branch_id")
+        )
         identity = (
             _required_text(prediction, table="predictions", field="pipeline_id"),
             _required_text(prediction, table="predictions", field="chain_id"),
             _required_text(prediction, table="predictions", field="fold_id"),
             _required_text(prediction, table="predictions", field="partition"),
             _required_text(prediction, table="predictions", field="model_name"),
-            _required_nonnegative_int(prediction, table="predictions", field="branch_id"),
+            normalized_branch_id,
         )
         if identity in identities:
             raise _unsupported("strict DuckDB workspace preview found duplicate target natural prediction identity")
@@ -576,48 +575,51 @@ def _normalise_rows(rows: dict[str, tuple[dict[str, Any], ...]]) -> dict[str, tu
     }
 
 
-def _validate_relations(
-    rows: dict[str, tuple[dict[str, Any], ...]],
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _validate_relations(rows: dict[str, tuple[dict[str, Any], ...]]) -> None:
+    """Validate the complete closed run → pipeline → chain → prediction graph."""
     for table, table_rows in rows.items():
         _validate_unique_ids(table_rows, table=table)
-    if len(rows["runs"]) != 1 or len(rows["pipelines"]) != 1 or len(rows["chains"]) != 1:
-        raise _unsupported("strict DuckDB workspace preview requires exactly one run, pipeline, and chain")
-    if not rows["predictions"]:
-        raise _unsupported("strict DuckDB workspace preview requires at least one prediction")
 
-    run = rows["runs"][0]
-    pipeline = rows["pipelines"][0]
-    chain = rows["chains"][0]
-    run_id = _required_text(run, table="runs", field="run_id")
-    pipeline_id = _required_text(pipeline, table="pipelines", field="pipeline_id")
-    chain_id = _required_text(chain, table="chains", field="chain_id")
-    _required_text(run, table="runs", field="name")
-    _required_text(pipeline, table="pipelines", field="name")
-    dataset_name = _required_text(pipeline, table="pipelines", field="dataset_name")
-    _required_text(chain, table="chains", field="steps")
-    _required_text(chain, table="chains", field="model_class")
-    _required_nonnegative_int(chain, table="chains", field="model_step_idx")
-    if _required_text(pipeline, table="pipelines", field="run_id") != run_id:
-        raise _unsupported("strict DuckDB workspace preview found pipeline.run_id outside the single source run")
-    if _required_text(chain, table="chains", field="pipeline_id") != pipeline_id:
-        raise _unsupported("strict DuckDB workspace preview found chain.pipeline_id outside the single source pipeline")
-    for field in ("generator_choices",):
-        if not _empty_jsonish(pipeline.get(field)):
-            raise _unsupported(f"strict DuckDB workspace preview refuses non-empty pipelines.{field}")
-    for field in ("fold_artifacts", "shared_artifacts", "branch_path"):
-        if not _empty_jsonish(chain.get(field)):
-            raise _unsupported(f"strict DuckDB workspace preview refuses non-empty chains.{field}")
-    for field in ("best_val", "best_test"):
-        _optional_finite_number(pipeline, table="pipelines", field=field)
-    _optional_nonnegative_int(pipeline, table="pipelines", field="duration_ms")
-    _optional_nonnegative_int(chain, table="chains", field="source_index")
+    run_ids: set[str] = set()
+    for run in rows["runs"]:
+        run_ids.add(_required_text(run, table="runs", field="run_id"))
+        _required_text(run, table="runs", field="name")
+
+    pipelines_by_id: dict[str, dict[str, Any]] = {}
+    for pipeline in rows["pipelines"]:
+        pipeline_id = _required_text(pipeline, table="pipelines", field="pipeline_id")
+        pipelines_by_id[pipeline_id] = pipeline
+        _required_text(pipeline, table="pipelines", field="name")
+        _required_text(pipeline, table="pipelines", field="dataset_name")
+        if _required_text(pipeline, table="pipelines", field="run_id") not in run_ids:
+            raise _unsupported("strict DuckDB workspace preview found pipeline.run_id outside the source run graph")
+        if not _empty_jsonish(pipeline.get("generator_choices")):
+            raise _unsupported("strict DuckDB workspace preview refuses non-empty pipelines.generator_choices")
+        for field in ("best_val", "best_test"):
+            _optional_finite_number(pipeline, table="pipelines", field=field)
+        _optional_nonnegative_int(pipeline, table="pipelines", field="duration_ms")
+
+    chains_by_id: dict[str, dict[str, Any]] = {}
+    for chain in rows["chains"]:
+        chain_id = _required_text(chain, table="chains", field="chain_id")
+        chains_by_id[chain_id] = chain
+        if _required_text(chain, table="chains", field="pipeline_id") not in pipelines_by_id:
+            raise _unsupported(
+                "strict DuckDB workspace preview found chain.pipeline_id outside the source pipeline graph"
+            )
+        _required_text(chain, table="chains", field="steps")
+        _required_text(chain, table="chains", field="model_class")
+        _required_nonnegative_int(chain, table="chains", field="model_step_idx")
+        for field in ("fold_artifacts", "shared_artifacts", "branch_path"):
+            if not _empty_jsonish(chain.get(field)):
+                raise _unsupported(f"strict DuckDB workspace preview refuses non-empty chains.{field}")
+        _optional_nonnegative_int(chain, table="chains", field="source_index")
 
     for log in rows["logs"]:
         _required_text(log, table="logs", field="log_id")
-        if _required_text(log, table="logs", field="pipeline_id") != pipeline_id:
+        if _required_text(log, table="logs", field="pipeline_id") not in pipelines_by_id:
             raise _unsupported(
-                "strict DuckDB workspace preview found log.pipeline_id outside the single source pipeline"
+                "strict DuckDB workspace preview found log.pipeline_id outside the source pipeline graph"
             )
         _required_text(log, table="logs", field="event")
         _required_nonnegative_int(log, table="logs", field="step_idx")
@@ -625,16 +627,24 @@ def _validate_relations(
 
     for prediction in rows["predictions"]:
         _required_text(prediction, table="predictions", field="prediction_id")
-        if _required_text(prediction, table="predictions", field="pipeline_id") != pipeline_id:
+        pipeline_id = _required_text(prediction, table="predictions", field="pipeline_id")
+        if pipeline_id not in pipelines_by_id:
             raise _unsupported(
-                "strict DuckDB workspace preview found prediction.pipeline_id outside the single source pipeline"
+                "strict DuckDB workspace preview found prediction.pipeline_id outside the source pipeline graph"
             )
-        if _required_text(prediction, table="predictions", field="chain_id") != chain_id:
+        chain_id = _required_text(prediction, table="predictions", field="chain_id")
+        prediction_chain = chains_by_id.get(chain_id)
+        if prediction_chain is None:
             raise _unsupported(
-                "strict DuckDB workspace preview found prediction.chain_id outside the single source chain"
+                "strict DuckDB workspace preview found prediction.chain_id outside the source chain graph"
             )
-        if _required_text(prediction, table="predictions", field="dataset_name") != dataset_name:
-            raise _unsupported("strict DuckDB workspace preview requires predictions to use the pipeline dataset")
+        if _required_text(prediction_chain, table="chains", field="pipeline_id") != pipeline_id:
+            raise _unsupported("strict DuckDB workspace preview found prediction pipeline that does not own its chain")
+        pipeline = pipelines_by_id[pipeline_id]
+        if _required_text(prediction, table="predictions", field="dataset_name") != _required_text(
+            pipeline, table="pipelines", field="dataset_name"
+        ):
+            raise _unsupported("strict DuckDB workspace preview requires predictions to use their pipeline dataset")
         for field in ("model_name", "model_class", "fold_id", "partition", "metric", "task_type"):
             _required_text(prediction, table="predictions", field=field)
         _required_nonnegative_int(prediction, table="predictions", field="n_samples")
@@ -644,7 +654,6 @@ def _validate_relations(
         for field in ("branch_id", "exclusion_count"):
             _optional_nonnegative_int(prediction, table="predictions", field=field)
     _validate_target_prediction_identities(rows["predictions"])
-    return run, pipeline, chain
 
 
 def _array_records(rows: dict[str, tuple[dict[str, Any], ...]]) -> tuple[dict[str, Any], ...]:

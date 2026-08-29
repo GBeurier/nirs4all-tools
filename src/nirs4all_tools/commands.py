@@ -16,6 +16,7 @@ import math
 import re
 import shutil
 import sqlite3
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,18 @@ _OPAQUE_PRESERVABLE_KINDS = frozenset(
     }
 )
 _UNSAFE_ARRAY_FILENAME_RE = re.compile(r'[/\\:*?"<>|\s.]+')
+_WINDOWS_RESERVED_ARRAY_STEMS = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)),
+        *(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in ("¹", "²", "³")),
+    }
+)
+_ARRAY_SIDECAR_SUFFIX = ".parquet"
+_PORTABLE_ARRAY_FILENAME_MAX_BYTES = 255
 _RUNTIME_ARRAY_RECORD_FIELDS = (
     "prediction_id",
     "dataset_name",
@@ -644,16 +657,14 @@ def _nonfinite_runtime_array_field(record: dict[str, Any]) -> str | None:
     return None
 
 
-def _write_runtime_array_records(
-    output: Path,
-    records: list[dict[str, Any]],
-) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Write normalized runtime array records to Parquet sidecars."""
-    arrow = _pyarrow_runtime_array_schema()
-    if arrow is None:
-        raise _runtime_array_sidecar_unavailable()
-    pa, pq, schema = arrow
+def _validate_runtime_array_records(records: list[dict[str, Any]]) -> None:
+    """Validate sidecar records before output creation or Parquet writing.
 
+    Runtime array lookup derives a filename solely from ``dataset_name``.  The
+    mapping must therefore be injective under the portable filesystem rules,
+    otherwise two distinct datasets can silently land in one sidecar.
+    """
+    portable_names: dict[str, str] = {}
     for record in records:
         missing = [field for field in _RUNTIME_ARRAY_RECORD_FIELDS if field not in record]
         if missing:
@@ -670,6 +681,59 @@ def _write_runtime_array_records(
                 cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
                 mitigation="use --copy-only to preserve this source verbatim, or repair the non-finite array value",
             )
+        dataset_name = record["dataset_name"]
+        if not isinstance(dataset_name, str) or not dataset_name.strip():
+            raise UnsupportedInput(
+                "runtime array sidecar record requires a non-empty dataset_name",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="preserve the source opaque, or repair the source dataset identity",
+            )
+        if any(ord(character) < 32 for character in dataset_name):
+            raise UnsupportedInput(
+                f"dataset_name {dataset_name!r} contains a control character unsupported by portable sidecars",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="preserve the source opaque, or rename the dataset before conversion",
+            )
+        filename = _sanitize_array_filename(dataset_name)
+        reserved_stem = filename.rstrip(" .").split(".", maxsplit=1)[0].upper()
+        if reserved_stem in _WINDOWS_RESERVED_ARRAY_STEMS:
+            raise UnsupportedInput(
+                f"dataset_name {dataset_name!r} resolves to Windows-reserved sidecar stem {reserved_stem!r}",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="preserve the source opaque, or rename the dataset before conversion",
+            )
+        output_filename = f"{filename}{_ARRAY_SIDECAR_SUFFIX}"
+        if (
+            len(output_filename) > _PORTABLE_ARRAY_FILENAME_MAX_BYTES
+            or len(output_filename.encode("utf-8")) > _PORTABLE_ARRAY_FILENAME_MAX_BYTES
+        ):
+            raise UnsupportedInput(
+                f"dataset_name {dataset_name!r} resolves to a sidecar filename longer than portable limits",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="preserve the source opaque, or shorten the dataset name before conversion",
+            )
+        portable_name = unicodedata.normalize("NFC", filename).casefold()
+        previous_dataset = portable_names.setdefault(portable_name, dataset_name)
+        if previous_dataset != dataset_name:
+            raise UnsupportedInput(
+                "distinct dataset names resolve to the same portable runtime sidecar filename: "
+                f"{previous_dataset!r}, {dataset_name!r}",
+                cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+                mitigation="preserve the source opaque, or rename datasets before conversion",
+            )
+
+
+def _write_runtime_array_records(
+    output: Path,
+    records: list[dict[str, Any]],
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    """Write normalized runtime array records to Parquet sidecars."""
+    arrow = _pyarrow_runtime_array_schema()
+    if arrow is None:
+        raise _runtime_array_sidecar_unavailable()
+    pa, pq, schema = arrow
+
+    _validate_runtime_array_records(records)
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for record in records:
@@ -683,7 +747,7 @@ def _write_runtime_array_records(
     schema_names = [field.name for field in schema]
     for filename, group in sorted(grouped.items()):
         table = pa.table({name: [record[name] for record in group] for name in schema_names}, schema=schema)
-        rel = f"{_ARRAYS_DIRNAME}/{filename}.parquet"
+        rel = f"{_ARRAYS_DIRNAME}/{filename}{_ARRAY_SIDECAR_SUFFIX}"
         path = output / rel
         pq.write_table(table, path, compression="zstd", compression_level=3)
         checksums[rel] = sha256_file(path)
@@ -892,7 +956,8 @@ def _dry_run_unsupported_items(input_path: Path, detection: DetectionResult) -> 
             continue
         if art.source_kind == KIND_DUCKDB_WORKSPACE and standalone_duckdb:
             try:
-                load_duckdb_workspace_preview(_artifact_source_path(input_path, art))
+                preview = load_duckdb_workspace_preview(_artifact_source_path(input_path, art))
+                _validate_runtime_array_records(runtime_array_records_from_duckdb_workspace(preview))
                 if _pyarrow_runtime_array_schema() is None:
                     raise _runtime_array_sidecar_unavailable()
             except UnsupportedInput as exc:
@@ -1135,6 +1200,7 @@ def migrate(
             duckdb_artifact = duckdb_artifacts[0]
             try:
                 duckdb_preview = load_duckdb_workspace_preview(_artifact_source_path(input_path, duckdb_artifact))
+                _validate_runtime_array_records(runtime_array_records_from_duckdb_workspace(duckdb_preview))
                 if _pyarrow_runtime_array_schema() is None:
                     raise _runtime_array_sidecar_unavailable()
             except UnsupportedInput as exc:
