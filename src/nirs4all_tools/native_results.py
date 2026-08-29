@@ -13,12 +13,13 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from . import vocab
 from .errors import UnsupportedInput
 
 NATIVE_RESULTS_PREVIEW_VERSION = 1
+NATIVE_RESULTS_LOWERING_SCHEMA_VERSION: Final = 3
 
 _REQUIRED_MANIFEST_FIELDS = ("schema_version", "run_id", "engine", "score_set_hash")
 _REQUIRED_PREDICTION_COLUMNS = frozenset(
@@ -181,6 +182,17 @@ def load_native_results_preview(run_dir: Path) -> NativeResultsPreview:
             "native-results-v1 schema gate missing manifest field(s): " + ", ".join(missing_manifest),
             cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
             mitigation="preserve the native results opaque, or regenerate with the current native-results writer",
+        )
+
+    schema_version = manifest.get("schema_version")
+    if type(schema_version) is not int or schema_version != NATIVE_RESULTS_LOWERING_SCHEMA_VERSION:
+        raise UnsupportedInput(
+            "native-results-v1 schema gate only lowers exact manifest.schema_version "
+            f"{NATIVE_RESULTS_LOWERING_SCHEMA_VERSION}, got {schema_version!r}",
+            cause=vocab.CAUSE_UNSUPPORTED_SHAPE,
+            mitigation=(
+                "preserve this native results directory opaque, or regenerate it with the current native-results writer"
+            ),
         )
 
     if manifest.get("engine") != "dag-ml":

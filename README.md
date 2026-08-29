@@ -90,8 +90,9 @@ Current schema-transform support is intentionally narrow:
   arrays; it refuses artifact references, sidecar filename collisions, unknown
   source files, and broken graph ownership before output creation. The original
   database remains checksummed under `preserved/duckdb-workspace/`;
-- one standalone current dag-ml `native-results-v1` directory with a valid
-  `score_set_hash` and canonical `predictions.parquet` projection is lowered to
+- one standalone current dag-ml `native-results-v1` directory with exact integer
+  `schema_version: 3`, a valid `score_set_hash`, and canonical
+  `predictions.parquet` projection is lowered to
   workspace-v2 run/pipeline/chain/prediction/artifact metadata plus
   runtime-readable `arrays/<dataset>.parquet` sidecars; the original native
   payload is still checksummed under `preserved/native-results-v1/`;

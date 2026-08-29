@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from .n4a_archive import N4aArchiveRefusal, inspect_n4a_archive
+from .native_results import NATIVE_RESULTS_LOWERING_SCHEMA_VERSION
 from .policy import read_only_sqlite_uri
 
 # --- source_kind constants (spec §4 table) ---------------------------------
@@ -38,7 +39,7 @@ KIND_UNKNOWN: Final = "unknown"
 # --- Versions this build supports (forward-version refusal anchors) --------
 SUPPORTED_SQLITE_USER_VERSION: Final = 2
 SUPPORTED_BUNDLE_FORMAT_VERSION: Final = (1, 0)
-SUPPORTED_NATIVE_MANIFEST_VERSION: Final = 3
+SUPPORTED_NATIVE_MANIFEST_VERSION: Final = NATIVE_RESULTS_LOWERING_SCHEMA_VERSION
 
 #: Note attached to artifacts that are preserved verbatim and never executed.
 _OPAQUE_NOTE: Final = "preserved opaque; never executed"
