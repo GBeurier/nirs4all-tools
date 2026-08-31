@@ -21,6 +21,7 @@ CAUSE_FORCED_IN_PLACE_REFUSED: Final = "forced_in_place_refused"
 CAUSE_NON_EMPTY_OUTPUT: Final = "non_empty_output"
 CAUSE_FORWARD_VERSION: Final = "forward_version"
 CAUSE_VERIFICATION_FAILED: Final = "verification_failed"
+CAUSE_INSUFFICIENT_STORAGE: Final = "insufficient_storage"
 
 CAUSES: Final = frozenset(
     {
@@ -32,6 +33,7 @@ CAUSES: Final = frozenset(
         CAUSE_NON_EMPTY_OUTPUT,
         CAUSE_FORWARD_VERSION,
         CAUSE_VERIFICATION_FAILED,
+        CAUSE_INSUFFICIENT_STORAGE,
     }
 )
 

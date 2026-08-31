@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -1961,6 +1962,185 @@ def test_migrate_resume_refuses_pre_terminal_manifest_but_verify_stays_available
     assert raised.value.cause == vocab.CAUSE_INVALID_REQUEST
     assert policy.diff_snapshots(source_before, policy.snapshot_tree(sqlite_v2_workspace)) == []
     assert policy.diff_snapshots(output_before, policy.snapshot_tree(out)) == []
+
+
+def test_copy_only_capacity_refuses_before_private_source_staging(
+    sqlite_v2_workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+
+    def refuse_capacity(*_requests) -> None:
+        raise PolicyRefusal(
+            "insufficient test storage",
+            cause=vocab.CAUSE_INSUFFICIENT_STORAGE,
+            mitigation="free test storage",
+        )
+
+    monkeypatch.setattr(commands, "assert_storage_capacity", refuse_capacity)
+    monkeypatch.setattr(
+        commands,
+        "materialized_source_tree_nofollow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("source stage must not start")),
+    )
+
+    with pytest.raises(PolicyRefusal) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INSUFFICIENT_STORAGE
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("existing_empty", [False, True])
+def test_copy_only_enospc_never_publishes_partial_output(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_empty: bool,
+) -> None:
+    out = tmp_path / "out"
+    if existing_empty:
+        out.mkdir()
+
+    def exhaust_storage(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "injected full filesystem")
+
+    monkeypatch.setattr(commands, "_copy_only", exhaust_storage)
+
+    with pytest.raises(PolicyRefusal) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INSUFFICIENT_STORAGE
+    assert out.is_dir() if existing_empty else not out.exists()
+    if existing_empty:
+        assert list(out.iterdir()) == []
+    assert not list(tmp_path.glob(".nirs4all-tools-publish-*"))
+
+
+def test_copy_only_internal_contract_enospc_keeps_existing_empty_output(
+    sqlite_v2_workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    original_write_json = commands._write_json
+
+    def exhaust_manifest(path: Path, payload: dict) -> None:
+        if path.name == contracts.DEFAULT_MANIFEST_NAME:
+            raise OSError(errno.ENOSPC, "injected contract exhaustion")
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(commands, "_write_json", exhaust_manifest)
+
+    with pytest.raises(PolicyRefusal) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INSUFFICIENT_STORAGE
+    assert list(out.iterdir()) == []
+    assert not list(tmp_path.glob(".nirs4all-tools-publish-*"))
+
+
+@pytest.mark.parametrize("existing_empty", [False, True])
+def test_copy_only_external_contract_enospc_does_not_publish_output(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_empty: bool,
+) -> None:
+    out = tmp_path / "out"
+    if existing_empty:
+        out.mkdir()
+    external_manifest = tmp_path / "contracts" / "manifest.json"
+
+    def exhaust_external(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "injected external contract exhaustion")
+
+    monkeypatch.setattr(commands, "_prepare_external_contract", exhaust_external)
+
+    with pytest.raises(PolicyRefusal) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            manifest_path=external_manifest,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_INSUFFICIENT_STORAGE
+    assert out.is_dir() if existing_empty else not out.exists()
+    if existing_empty:
+        assert list(out.iterdir()) == []
+    assert not external_manifest.exists()
+    assert not list(tmp_path.glob(".nirs4all-tools-publish-*"))
+
+
+def test_copy_only_existing_empty_output_and_external_manifest_succeed(
+    sqlite_v2_workspace: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir(mode=0o750)
+    external_manifest = tmp_path / "contracts" / "custom-manifest.json"
+
+    result = commands.migrate(
+        sqlite_v2_workspace,
+        output=out,
+        target=vocab.TARGET_WORKSPACE_V2,
+        manifest_path=external_manifest,
+        copy_only=True,
+        verify=True,
+        tool_version="0.0.1",
+    )
+
+    assert result == ExitCode.SUCCESS
+    assert stat.S_IMODE(out.stat().st_mode) == 0o750
+    assert external_manifest.exists()
+    assert not (out / contracts.DEFAULT_MANIFEST_NAME).exists()
+    assert commands.verify(out, manifest_path=external_manifest) == ExitCode.SUCCESS
+
+
+def test_copy_only_refuses_destination_race_without_deleting_third_party_data(
+    sqlite_v2_workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    third_party = out / "third-party.txt"
+    original_fsync = commands._fsync_publication_tree
+
+    def populate_destination(publication: Path) -> None:
+        original_fsync(publication)
+        out.mkdir()
+        third_party.write_text("keep", encoding="utf-8")
+
+    monkeypatch.setattr(commands, "_fsync_publication_tree", populate_destination)
+
+    with pytest.raises(PolicyRefusal) as raised:
+        commands.migrate(
+            sqlite_v2_workspace,
+            output=out,
+            target=vocab.TARGET_WORKSPACE_V2,
+            copy_only=True,
+            tool_version="0.0.1",
+        )
+
+    assert raised.value.cause == vocab.CAUSE_NON_EMPTY_OUTPUT
+    assert third_party.read_text(encoding="utf-8") == "keep"
+    assert not list(tmp_path.glob(".nirs4all-tools-publish-*"))
 
 
 @pytest.mark.parametrize(

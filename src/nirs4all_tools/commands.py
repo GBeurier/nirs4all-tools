@@ -11,11 +11,15 @@ stay here rather than in the runtime.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
+import stat
+import tempfile
 import unicodedata
 from collections import Counter
 from datetime import UTC, datetime
@@ -45,7 +49,7 @@ from .duckdb_workspace import (
     lower_duckdb_workspace_preview,
     runtime_array_records_from_duckdb_workspace,
 )
-from .errors import SourceIntegrityError, UnsupportedInput, VerificationFailed
+from .errors import PolicyRefusal, SourceIntegrityError, UnsupportedInput, VerificationFailed
 from .exit_codes import ExitCode
 from .legacy_runs import (
     LEGACY_RUNS_PREVIEW_VERSION,
@@ -68,12 +72,15 @@ from .native_results import (
     runtime_array_records_from_native_results,
 )
 from .policy import (
+    StorageRequest,
     TreeSnapshot,
     assert_disjoint,
     assert_output_available,
     assert_path_outside_source,
     assert_safe_source_tree,
+    assert_storage_capacity,
     copy_regular_file_nofollow,
+    diff_snapshots,
     materialized_source_tree_nofollow,
     read_only_sqlite_uri,
     realpath,
@@ -81,6 +88,7 @@ from .policy import (
     snapshot_tree_nofollow,
     source_guard,
     source_guard_nofollow,
+    tree_file_sizes,
 )
 from .workspace_v2 import WORKSPACE_V2_TABLES, create_workspace_v2_schema
 
@@ -146,6 +154,10 @@ _RUNTIME_ARRAY_RECORD_FIELDS = (
     "weights",
     "sample_metadata",
 )
+_CONTRACT_CAPACITY_BYTES = 1 << 20
+_CAPACITY_ERRNOS = frozenset(
+    value for value in (errno.ENOSPC, getattr(errno, "EDQUOT", None)) if isinstance(value, int)
+)
 
 
 def _now_iso() -> str:
@@ -155,6 +167,32 @@ def _now_iso() -> str:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _json_bytes(payload: dict[str, Any]) -> bytes:
+    """Serialize one durable JSON contract deterministically."""
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _is_capacity_error(exc: BaseException) -> bool:
+    """Return whether an exception chain contains ENOSPC or quota exhaustion."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno in _CAPACITY_ERRNOS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _capacity_refusal(exc: BaseException) -> PolicyRefusal:
+    """Map runtime disk/quota exhaustion onto the stable policy contract."""
+    return PolicyRefusal(
+        f"migration storage was exhausted before publication: {exc}",
+        cause=vocab.CAUSE_INSUFFICIENT_STORAGE,
+        mitigation="free space or choose TMPDIR/output/contract paths on volumes with sufficient capacity",
+    )
 
 
 def _generated_contract_names() -> list[str]:
@@ -592,6 +630,60 @@ def _prepare_migration_contract_paths(
             unsupported_report_path=paths[3],
         )
     return paths
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Return whether two canonical paths are equal or ``path`` is below ``root``."""
+    return path == root or root in path.parents
+
+
+def _copy_only_capacity_preflight(
+    source_snapshot: TreeSnapshot,
+    *,
+    output: Path,
+    contract_paths: tuple[Path | None, Path | None, Path | None, Path | None],
+) -> None:
+    """Reserve the simultaneous private-source and copy publication peak."""
+    sizes = tree_file_sizes(source_snapshot)
+    directory_count = sum(1 for size, _mtime, _digest in source_snapshot.entries.values() if size == -1)
+    temporary_parent = realpath(Path(tempfile.gettempdir()))
+    output_dir = realpath(output)
+    internal_contract_count = sum(
+        1
+        for contract_path in contract_paths
+        if contract_path is not None and _path_is_within(realpath(contract_path), output_dir)
+    )
+    requests = [
+        StorageRequest(
+            temporary_parent,
+            sizes,
+            extra_bytes=(directory_count + 1) * 4096,
+            extra_files=directory_count + 1,
+            purpose="private source stage",
+        ),
+        StorageRequest(
+            output_dir.parent,
+            sizes,
+            extra_bytes=(internal_contract_count * _CONTRACT_CAPACITY_BYTES) + ((directory_count + 2) * 4096),
+            extra_files=directory_count + internal_contract_count + 2,
+            purpose="transactional copy-only publication",
+        ),
+    ]
+    for contract_path in contract_paths:
+        if contract_path is None:
+            continue
+        resolved = realpath(contract_path)
+        if _path_is_within(resolved, output_dir):
+            continue
+        requests.append(
+            StorageRequest(
+                resolved.parent,
+                extra_bytes=_CONTRACT_CAPACITY_BYTES,
+                extra_files=1,
+                purpose=f"external contract {resolved.name}",
+            )
+        )
+    assert_storage_capacity(*requests)
 
 
 def _terminal_exit_code_for_status(status: object) -> ExitCode | None:
@@ -1979,11 +2071,46 @@ def migrate(
                 id_map_path=id_map_path,
                 unsupported_report_path=unsupported_report_path,
             )
+    preflight_snapshot: TreeSnapshot | None = None
+    if copy_only and not dry_run:
+        # Capacity must be checked before the source-sized private stage is
+        # created.  Repeat the option/path guards in the staged worker later;
+        # this early pass deliberately performs no writes.
+        _validate_migrate_options(
+            target=target,
+            checksums_algo=checksums_algo,
+            dry_run=dry_run,
+            strict=strict,
+            copy_only=copy_only,
+            resume=resume,
+            trusted_load_joblib=trusted_load_joblib,
+        )
+        contract_paths = _prepare_migration_contract_paths(
+            source_path=source_path,
+            output=output,
+            manifest_path=manifest_path,
+            report_path=report_path,
+            id_map_path=id_map_path,
+            unsupported_report_path=unsupported_report_path,
+            dry_run=False,
+        )
+        preflight_snapshot = snapshot_tree_nofollow(source_path)
+        assert_output_available(output, resume=False)
+        _copy_only_capacity_preflight(preflight_snapshot, output=output, contract_paths=contract_paths)
     output_was_missing = not output.exists()
     try:
         with materialized_source_tree_nofollow(
             source_path, forbidden_paths=(output,), source_is_canonical=True
         ) as staged_source, source_guard_nofollow(source_path, before=staged_source.source_snapshot):
+            if preflight_snapshot is not None:
+                changes = diff_snapshots(preflight_snapshot, staged_source.source_snapshot)
+                if changes:
+                    preview = ", ".join(changes[:5])
+                    raise SourceIntegrityError(
+                        f"source changed after capacity preflight ({len(changes)} path(s): {preview})",
+                        cause=vocab.CAUSE_RUNTIME_ERROR,
+                        mitigation="rerun migration against a stable source",
+                    )
             return _migrate_from_materialized_source(
                 staged_source.path,
                 source_path=source_path,
@@ -2003,12 +2130,18 @@ def migrate(
                 trusted_load_joblib=trusted_load_joblib,
                 tool_version=tool_version,
             )
-    except SourceIntegrityError:
+    except SourceIntegrityError as exc:
         # The stage has already prevented substituted bytes from reaching an
         # output.  Preserve the existing no-publication behavior if the
         # original integrity guard nevertheless trips after a successful run.
         if output_was_missing and output.exists():
             shutil.rmtree(output, ignore_errors=True)
+        if copy_only and _is_capacity_error(exc):
+            raise _capacity_refusal(exc) from exc
+        raise
+    except OSError as exc:
+        if copy_only and _is_capacity_error(exc):
+            raise _capacity_refusal(exc) from exc
         raise
 
 
@@ -2482,6 +2615,61 @@ def _run_dry_run(
     return ExitCode.UNSUPPORTED_INPUT if refused else ExitCode.SUCCESS
 
 
+def _publication_contract_path(path: Path | None, *, output: Path, publication: Path) -> Path | None:
+    """Map an internal final contract path into a sibling publication tree."""
+    if path is None:
+        return None
+    resolved = realpath(path)
+    if not _path_is_within(resolved, output):
+        return None
+    return publication / resolved.relative_to(output)
+
+
+def _prepare_external_contract(path: Path, payload: dict[str, Any]) -> tuple[Path, Path]:
+    """Fully write and fsync an external contract before output publication."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(_json_bytes(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return path, temporary
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory entries on the POSIX platforms required by staging."""
+    descriptor = os.open(path, os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_publication_tree(root: Path) -> None:
+    """Flush every regular payload/contract and its directory hierarchy."""
+    directories: list[Path] = []
+    for current, child_directories, filenames in os.walk(root):
+        current_path = Path(current)
+        directories.append(current_path)
+        for filename in filenames:
+            path = current_path / filename
+            if not stat.S_ISREG(path.lstat().st_mode):
+                continue
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        child_directories.sort()
+    for directory in reversed(directories):
+        _fsync_directory(directory)
+
+
 def _run_copy_only(
     input_path: Path,
     output: Path,
@@ -2495,39 +2683,97 @@ def _run_copy_only(
     *,
     verify_after: bool = False,
 ) -> ExitCode:
-    """Faithful checksummed copy + contracts; rolls back only tool-created output."""
-    created = not output.exists()
+    """Faithful copy staged beside ``output`` and atomically published.
+
+    Contracts inside ``output`` participate in the directory rename. Custom
+    external contracts are fully written to sibling temporary files first and
+    atomically replaced only after the output commit; filesystems cannot offer
+    one atomic transaction spanning those independent destinations.
+    """
+    output = realpath(output)
+    assert_output_available(output, resume=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    publication = Path(tempfile.mkdtemp(prefix=".nirs4all-tools-publish-", dir=output.parent))
+    prepared_external: list[tuple[Path, Path]] = []
     try:
-        output.mkdir(parents=True, exist_ok=True)
-        _copy_only(input_path, output, manifest, n4a_artifacts=n4a_artifacts)
+        internal_manifest = _publication_contract_path(manifest_path, output=output, publication=publication)
+        internal_report = _publication_contract_path(report_path, output=output, publication=publication)
+        internal_id_map = _publication_contract_path(id_map_path, output=output, publication=publication)
+        internal_unsupported = _publication_contract_path(
+            unsupported_report_path, output=output, publication=publication
+        )
+
+        _copy_only(input_path, publication, manifest, n4a_artifacts=n4a_artifacts)
         manifest["target"]["kind"] = "copy-only"
         manifest["tool"]["completed_at"] = _now_iso()
         report["status"] = vocab.STATUS_SUCCESS
         report["target_summary"]["kind"] = "copy-only"
         report["recommended_next_command"] = f"nirs4all-tools legacy verify {output} --manifest {manifest_path}"
         _attest_terminal_outcome(manifest, report)
-        if manifest_path is not None:
-            _write_json(manifest_path, manifest)
-        _write_unsupported_report(
-            unsupported_report_path,
+        if internal_manifest is not None:
+            _write_json(internal_manifest, manifest)
+        unsupported_document = contracts.build_unsupported_report(
             manifest=manifest,
             report=report,
-            target_path=output,
+            target_path=str(output),
         )
+        if internal_unsupported is not None:
+            _write_json(internal_unsupported, unsupported_document)
         if verify_after:
             exclude_paths = _contract_exclude_paths(
-                output, manifest_path, report_path, id_map_path, unsupported_report_path
+                publication, internal_manifest, internal_report, internal_id_map, internal_unsupported
             )
-            report["verification_summary"] = _verification_summary_from_manifest(output, manifest, exclude_paths)
+            report["verification_summary"] = _verification_summary_from_manifest(
+                publication, manifest, exclude_paths
+            )
             _raise_if_verification_failed(report["verification_summary"])
-        if report_path is not None:
-            _write_json(report_path, report)
-        if id_map_path is not None:
-            _write_json(id_map_path, manifest["old_to_new_ids"])
-    except Exception:
-        if created and output.exists():
-            shutil.rmtree(output, ignore_errors=True)
+        if internal_report is not None:
+            _write_json(internal_report, report)
+        if internal_id_map is not None:
+            _write_json(internal_id_map, manifest["old_to_new_ids"])
+
+        external_documents = (
+            (manifest_path, internal_manifest, manifest),
+            (unsupported_report_path, internal_unsupported, unsupported_document),
+            (report_path, internal_report, report),
+            (id_map_path, internal_id_map, manifest["old_to_new_ids"]),
+        )
+        for configured_path, internal_path, document in external_documents:
+            if configured_path is not None and internal_path is None:
+                prepared_external.append(_prepare_external_contract(realpath(configured_path), document))
+
+        _fsync_publication_tree(publication)
+        # A concurrent writer may have populated a previously absent/empty
+        # destination. Recheck immediately before rename and never remove it.
+        assert_output_available(output, resume=False)
+        output_mode = stat.S_IMODE(output.stat().st_mode) if output.exists() else 0o755
+        os.chmod(publication, output_mode)
+        try:
+            os.replace(publication, output)
+        except OSError as exc:
+            if exc.errno in {errno.EEXIST, errno.ENOTEMPTY, errno.EISDIR, errno.ENOTDIR}:
+                raise PolicyRefusal(
+                    f"output changed before transactional publication: {output}",
+                    cause=vocab.CAUSE_NON_EMPTY_OUTPUT,
+                    mitigation="choose a fresh empty output directory and rerun",
+                ) from exc
+            raise
+        publication = Path()
+        _fsync_directory(output.parent)
+
+        for destination, temporary in prepared_external:
+            os.replace(temporary, destination)
+            _fsync_directory(destination.parent)
+        prepared_external.clear()
+    except Exception as exc:
+        if _is_capacity_error(exc):
+            raise _capacity_refusal(exc) from exc
         raise
+    finally:
+        if publication != Path() and publication.exists():
+            shutil.rmtree(publication, ignore_errors=True)
+        for _destination, temporary in prepared_external:
+            temporary.unlink(missing_ok=True)
     return ExitCode.SUCCESS
 
 

@@ -97,6 +97,19 @@ the portable slash-separated checksum ledger. In particular, a POSIX filename
 containing a literal backslash is refused before output creation rather than
 creating an output that cannot later verify.
 
+Before `--copy-only` creates its private source stage, it reserves the logical
+size of every source file (including sparse files and each hard-link name) on
+the relevant `TMPDIR`, output, and external-contract volumes. Requests sharing
+a filesystem are summed because the private source and sibling publication
+trees coexist. A capacity shortfall or runtime `ENOSPC`/quota failure is a
+policy refusal (exit `40`), not an invalid archive. The copied payload and all
+default in-output contracts are written to a private sibling directory and
+published with one directory rename; before that commit, a missing output
+remains missing and an existing empty output remains empty if the run fails.
+Custom external contracts are prepared and atomically replaced independently
+after that output commit, because separate filesystems cannot share one global
+atomic transaction.
+
 - `legacy export-n4mm` can, only after explicit `--trusted-load-joblib`, prove
   a finite affine equation from exactly a fitted sklearn `PLSRegression` and
   export it through the public `pls4all` binding (Methods ABI 2.3) as a native
@@ -163,7 +176,7 @@ creating an output that cannot later verify.
 | `10` | migrated with warnings (best-effort preserved opaque / non-fatal skips) |
 | `20` | unsupported input (unknown, unsafe archive, forward-version source, strict unsupported item, or unattested `--resume`) |
 | `30` | verification failed |
-| `40` | refused by policy (in-place / aliased output, or non-empty fresh output) |
+| `40` | refused by policy (in-place / aliased output, non-empty fresh output, or insufficient storage) |
 | `70` | internal error (incl. source-tree integrity assertion failure) |
 
 ## Contracts
