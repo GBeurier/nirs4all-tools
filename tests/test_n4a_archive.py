@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import struct
@@ -154,6 +155,24 @@ def test_copy_validated_n4a_archive_keeps_the_validated_bytes_and_version(tmp_pa
         )
     assert raised.value.rule == "archive_changed"
     assert not digest_mismatch.exists()
+
+
+def test_copy_validated_n4a_archive_does_not_relabel_enospc_as_invalid_zip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _write_bundle(tmp_path / "safe.n4a", _valid_members())
+    destination = tmp_path / "output" / "safe.n4a"
+
+    def exhaust_storage(*_args, **_kwargs) -> None:
+        raise OSError(errno.ENOSPC, "injected full filesystem")
+
+    monkeypatch.setattr(n4a_archive, "_copy_exact", exhaust_storage)
+
+    with pytest.raises(OSError) as raised:
+        copy_validated_n4a_archive(archive, destination, expected_bundle_format_version="1.0")
+
+    assert raised.value.errno == errno.ENOSPC
+    assert not destination.exists()
 
 
 def test_copy_validated_n4a_archive_rejects_a_same_size_mutation_after_inspection(

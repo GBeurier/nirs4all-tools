@@ -9,6 +9,7 @@ CRC/length/DEFLATE boundaries and materializes only ``manifest.json``.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -984,6 +985,11 @@ def copy_validated_n4a_archive(
     except N4aArchiveRefusal:
         raise
     except (EOFError, OSError, RuntimeError, zlib.error, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        if isinstance(exc, OSError) and exc.errno in {
+            errno.ENOSPC,
+            getattr(errno, "EDQUOT", None),
+        }:
+            raise
         _refuse("invalid_zip", f"cannot validate and copy ZIP safely: {exc}")
     finally:
         if temporary is not None:

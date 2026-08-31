@@ -35,6 +35,113 @@ from .checksums import sha256_file
 from .errors import PolicyRefusal, SourceIntegrityError, UnsupportedInput
 
 _COPY_CHUNK_BYTES = 1 << 20
+_CAPACITY_METADATA_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class StorageRequest:
+    """Space and inode reservation associated with one destination path.
+
+    ``file_sizes`` contains logical sizes because copy-only materializes every
+    hard-link name independently and does not preserve sparse allocation.
+    Requests are grouped by ``st_dev`` before comparison so co-located source
+    and publication stages reserve their simultaneous peak, not two unrelated
+    per-path minima.
+    """
+
+    path: Path
+    file_sizes: tuple[int, ...] = ()
+    extra_bytes: int = 0
+    extra_files: int = 0
+    purpose: str = "migration"
+
+
+def tree_file_sizes(snapshot: TreeSnapshot) -> tuple[int, ...]:
+    """Return every regular-file logical size represented by ``snapshot``."""
+    return tuple(size for size, _mtime_ns, _digest in snapshot.entries.values() if size >= 0)
+
+
+def _existing_ancestor(path: Path) -> Path:
+    """Return the closest existing ancestor without creating filesystem state."""
+    candidate = realpath(path)
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return candidate
+
+
+def _round_allocation(size: int, fragment_size: int) -> int:
+    """Round one logical file size to the destination allocation unit."""
+    if size <= 0:
+        return fragment_size
+    return ((size + fragment_size - 1) // fragment_size) * fragment_size
+
+
+@dataclass
+class _StorageVolume:
+    available_bytes: int
+    available_files: int
+    required_bytes: int = 0
+    required_files: int = 0
+    purposes: list[str] = field(default_factory=list)
+
+
+def _storage_status(path: Path) -> tuple[int, os.statvfs_result]:
+    """Return the volume identity and capacity counters for a destination."""
+    ancestor = _existing_ancestor(path)
+    return ancestor.stat().st_dev, os.statvfs(ancestor)
+
+
+def assert_storage_capacity(*requests: StorageRequest) -> None:
+    """Refuse when grouped destination volumes cannot hold requested stages.
+
+    The check is advisory—free space can change immediately afterwards—but it
+    provides an early, deterministic refusal before private source staging.
+    Runtime ``ENOSPC``/``EDQUOT`` is still mapped separately by command code.
+    """
+    grouped: dict[int, _StorageVolume] = {}
+    for request in requests:
+        try:
+            device, filesystem = _storage_status(request.path)
+        except OSError as exc:
+            raise PolicyRefusal(
+                f"cannot inspect storage capacity for {request.purpose} at {request.path}: {exc}",
+                cause=vocab.CAUSE_INSUFFICIENT_STORAGE,
+                mitigation="choose writable staging/output locations with sufficient free space",
+            ) from exc
+        fragment_size = int(filesystem.f_frsize or filesystem.f_bsize or _CAPACITY_METADATA_BYTES)
+        required_bytes = sum(_round_allocation(size, fragment_size) for size in request.file_sizes)
+        required_bytes += _round_allocation(request.extra_bytes, fragment_size) if request.extra_bytes else 0
+        required_files = len(request.file_sizes) + request.extra_files
+        volume = grouped.setdefault(
+            device,
+            _StorageVolume(
+                available_bytes=int(filesystem.f_bavail) * fragment_size,
+                available_files=int(filesystem.f_favail),
+            ),
+        )
+        volume.required_bytes += required_bytes
+        volume.required_files += required_files
+        volume.purposes.append(request.purpose)
+
+    for volume in grouped.values():
+        required_bytes = volume.required_bytes
+        available_bytes = volume.available_bytes
+        required_files = volume.required_files
+        available_files = volume.available_files
+        lacks_bytes = required_bytes > available_bytes
+        lacks_files = required_files > available_files
+        if lacks_bytes or lacks_files:
+            purposes = ", ".join(volume.purposes)
+            raise PolicyRefusal(
+                "insufficient storage for "
+                f"{purposes}: need {required_bytes} byte(s) and {required_files} inode(s), "
+                f"have {available_bytes} byte(s) and {available_files} inode(s)",
+                cause=vocab.CAUSE_INSUFFICIENT_STORAGE,
+                mitigation="free space or choose TMPDIR/output/contract paths on volumes with sufficient capacity",
+            )
 
 
 def realpath(path: Path | str) -> Path:
@@ -1059,6 +1166,9 @@ __all__ = [
     "assert_disjoint",
     "assert_path_outside_source",
     "assert_output_available",
+    "StorageRequest",
+    "tree_file_sizes",
+    "assert_storage_capacity",
     "TreeSnapshot",
     "MaterializedSource",
     "snapshot_tree",

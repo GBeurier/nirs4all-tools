@@ -91,6 +91,38 @@ def test_output_available_refuses_file(tmp_path: Path) -> None:
         policy.assert_output_available(f, resume=False)
 
 
+def test_storage_capacity_groups_requests_on_the_same_volume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filesystem = os.statvfs_result((4096, 4096, 100, 100, 3, 100, 100, 100, 0, 255))
+    monkeypatch.setattr(policy, "_storage_status", lambda _path: (7, filesystem))
+
+    with pytest.raises(PolicyRefusal) as raised:
+        policy.assert_storage_capacity(
+            policy.StorageRequest(tmp_path / "source-stage", (4097,), purpose="source"),
+            policy.StorageRequest(tmp_path / "publication", (4097,), purpose="output"),
+        )
+
+    assert raised.value.cause == "insufficient_storage"
+    assert "source, output" in raised.value.message
+
+
+def test_storage_capacity_keeps_distinct_volumes_separate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filesystem = os.statvfs_result((4096, 4096, 100, 100, 2, 100, 100, 100, 0, 255))
+
+    def storage_status(path: Path):
+        return (1 if path.name == "source-stage" else 2), filesystem
+
+    monkeypatch.setattr(policy, "_storage_status", storage_status)
+
+    policy.assert_storage_capacity(
+        policy.StorageRequest(tmp_path / "source-stage", (4097,), purpose="source"),
+        policy.StorageRequest(tmp_path / "publication", (4097,), purpose="output"),
+    )
+
+
 def test_source_guard_passes_when_unchanged(tmp_path: Path) -> None:
     src = tmp_path / "ws"
     src.mkdir()
