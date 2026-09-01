@@ -711,6 +711,12 @@ def test_python_rerun_converted_pipeline(
         pipeline,
         (x, y),
         name="e2e_converted_legacy_pipeline_rerun",
+        # This witness intentionally reconstructs the historical Python
+        # pipeline.  The V1 default is the fail-closed dag-ml backend, whose
+        # in-memory path does not accept ``workspace_path``; selecting the
+        # retained legacy profile explicitly keeps this test from depending on
+        # an implicit backend fallback.
+        engine="legacy",
         verbose=0,
         save_artifacts=False,
         save_charts=False,
