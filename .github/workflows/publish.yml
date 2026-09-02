@@ -81,7 +81,7 @@ jobs:
 
       - name: Build sdist + wheel
         run: |
-          python -m pip install --upgrade build twine
+          python -m pip install build==1.6.0 twine==7.0.0
           python scripts/build_release.py
           python -m twine check dist/*
 
