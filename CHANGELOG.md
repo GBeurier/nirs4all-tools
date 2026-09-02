@@ -8,8 +8,9 @@ All notable changes to **nirs4all-tools** are documented here. The format follow
 
 ### Fixed
 
-- Make release wheels and sdists reproducible by deriving `SOURCE_DATE_EPOCH`
-  from the release commit and canonicalizing generated sdist PAX metadata.
+- Make release wheels and sdists reproducible by pinning the build toolchain,
+  deriving `SOURCE_DATE_EPOCH` from the release commit, and canonicalizing
+  generated sdist PAX metadata.
 
 ## [0.0.7] — 2026-09-02
 

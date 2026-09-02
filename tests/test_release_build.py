@@ -3,10 +3,13 @@ from __future__ import annotations
 import gzip
 import io
 import tarfile
+import tomllib
 from pathlib import Path
 
 import pytest
 from scripts.build_release import normalize_sdist, source_date_epoch
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _write_varying_sdist(path: Path, *, mtime: float, owner: str) -> None:
@@ -48,3 +51,14 @@ def test_source_date_epoch_rejects_invalid_environment(monkeypatch: pytest.Monke
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "not-an-epoch")
     with pytest.raises(ValueError, match="integer Unix timestamp"):
         source_date_epoch()
+
+
+def test_release_build_toolchain_is_exactly_pinned() -> None:
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["build-system"]["requires"] == [
+        "setuptools==84.0.0",
+        "wheel==0.48.0",
+    ]
+    workflow = (ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
+    assert "python -m pip install build==1.6.0 twine==7.0.0" in workflow
+    assert "python scripts/build_release.py" in workflow
