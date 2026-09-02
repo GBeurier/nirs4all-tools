@@ -1,2 +1,3 @@
 include scripts/__init__.py
 include scripts/build_release.py
+include scripts/write_release_sbom.py

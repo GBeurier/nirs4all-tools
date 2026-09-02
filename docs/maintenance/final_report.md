@@ -33,4 +33,4 @@ Modified: `.github/workflows/{ci,publish}.yml` (7 action SHA-pins).
 
 ## 12-month maintenance
 - Merge weekly Dependabot PRs after CI-green. Keep `CHANGELOG.md` current.
-- **Before release:** add the full `LICENSES/` texts and confirm the PyPI Trusted Publisher.
+- **Before release:** confirm the PyPI Trusted Publisher on the exact release tag.

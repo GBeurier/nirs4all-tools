@@ -20,11 +20,16 @@ Optional local hooks: `uvx pre-commit run --all-files`.
 | `ci.yml` | push/PR | install `.[dev,parquet]` → ruff + mypy + pytest |
 | `publish.yml` | **release / dispatch** | PyPI publish — **not** on branch push |
 
-All third-party actions are **SHA-pinned** (Dependabot-tracked; github-actions + pip).
+All third-party actions are **full-SHA pinned** (Dependabot-tracked). The release
+runner, Python micro version, build frontend, build backend, wheel, and Twine are
+also pinned. `publish.yml` rebuilds the distributions twice and refuses a byte
+mismatch before producing the artifact-bound CycloneDX SBOM.
 
 ## Known gaps (deepest-hardening roadmap)
 
-- **LICENSE blocker (release):** `LICENSE` is a dual-license *summary*; the full CeCILL-2.1 + AGPL-3.0
-  texts (a `LICENSES/` directory, as in the sibling repos) are **missing** — see `release_checklist.md`.
+- The historical license blocker is closed: the full CeCILL-2.1 and
+  AGPL-3.0-or-later texts plus commercial notices ship under `LICENSES/`.
+- External Trusted Publisher/OIDC configuration still requires verification on
+  the exact release tag; it cannot be proven by repository-local tests.
 - Consider fuzzing the untrusted-input parsers (SQLite/ZIP/JSON/YAML) given the migration threat model.
 - No enforced coverage floor yet (`pytest-cov` is available).
