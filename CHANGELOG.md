@@ -6,15 +6,14 @@ All notable changes to **nirs4all-tools** are documented here. The format follow
 
 ## Unreleased
 
-### Fixed
-
-- Make release wheels and sdists reproducible by pinning the build toolchain,
-  deriving `SOURCE_DATE_EPOCH` from the release commit, and canonicalizing
-  generated sdist PAX metadata.
-
 ## [0.0.7] — 2026-09-02
 
 ### Fixed
+- Make release wheels and sdists reproducible by pinning the build toolchain,
+  deriving `SOURCE_DATE_EPOCH` from the release commit, canonicalizing generated
+  sdist PAX metadata, and enforcing an A/B rebuild before publication.
+- Generate a deterministic CycloneDX SBOM bound to the exact source commit,
+  wheel, and sdist identities.
 - Ship the complete canonical CeCILL-2.1 and AGPL-3.0-or-later license texts,
   plus the commercial-license notices, in wheel and sdist metadata.
 - Keep the trusted PLS-to-N4MM migration extra on the qualified Methods 1.x
