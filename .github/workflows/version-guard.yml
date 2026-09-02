@@ -1,6 +1,8 @@
 name: version-guard
 
-# Guardrail: the in-repo version must never be ahead of the latest v* git tag.
+# Guardrail: the in-repo version must never be behind the latest v* git tag.
+# A branch may prepare the next version before its tag exists; publish.yml
+# separately requires exact tag/version equality before upload.
 
 on:
   push:
@@ -64,10 +66,14 @@ jobs:
           latest_version, latest_tag = max(candidates, key=lambda item: item[0])
           manifest = Version(re.sub(r"^[vV]", "", manifest_raw))
           print(f"nirs4all-tools manifest: {manifest}    latest tag = {latest_tag} ({latest_version})")
-          if manifest > latest_version:
+          if manifest < latest_version:
               print(
-                  f"::error::version-guard: manifest version {manifest} is ahead of latest tag {latest_tag}. "
-                  f"Tag v{manifest} before merging the bump to main."
+                  f"::error::version-guard: manifest version {manifest} is behind latest tag {latest_tag}. "
+                  "Bump the manifest before merging."
               )
               sys.exit(1)
-          print("OK: manifest is not ahead of the latest tag.")
+          if manifest > latest_version:
+              print(
+                  f"::notice::version-guard: preparing {manifest}; publish.yml will require tag v{manifest}."
+              )
+          print("OK: manifest is not behind the latest tag.")

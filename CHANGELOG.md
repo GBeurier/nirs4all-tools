@@ -6,7 +6,15 @@ All notable changes to **nirs4all-tools** are documented here. The format follow
 
 ## Unreleased
 
+## [0.0.7] — 2026-09-02
+
 ### Fixed
+- Ship the complete canonical CeCILL-2.1 and AGPL-3.0-or-later license texts,
+  plus the commercial-license notices, in wheel and sdist metadata.
+- Keep the trusted PLS-to-N4MM migration extra on the qualified Methods 1.x
+  public API line.
+- Allow a branch to prepare the next package version before its release tag;
+  publication still requires exact tag/version equality.
 - Refuse semantic lowering of `native-results-v1` directories unless their
   manifest declares the exact current integer `schema_version: 3`. Older or
   non-canonical variants remain opaque in best-effort mode and are refused by

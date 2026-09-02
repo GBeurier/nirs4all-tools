@@ -2,6 +2,10 @@
 
 > Generated from the automated pre-release audit (workflow wf_1fc87351-29f); the **Deepest hardening roadmap** section records the fullest realistic hardening even where the pragmatic pass does not implement it. Reviewed at Codex Gate 1.
 
+> Current status (2026-09-02): the historical license blocker recorded below
+> is closed. Complete CeCILL-2.1 and AGPL-3.0-or-later texts plus the commercial
+> notices now ship under `LICENSES/` and are included by package metadata.
+
 - **Mode:** IN SCOPE — pragmatic hardening + push
 - **Baseline HEAD:** `7c5070f`
 - **Role:** Shared/standalone Python CLI providing offline, one-way, no-in-place migration tools for legacy nirs4all artifacts (workspaces, .n4a bundles, loose prediction files) into nirs4all-workspace-v2.
@@ -59,7 +63,7 @@ nirs4all-tools is a small, well-structured pure-stdlib Python CLI (~4.7k src LOC
 ## Risks
 | severity | area | detail |
 |---|---|---|
-| high | licensing | /home/delete/nirs4all/nirs4all-tools/LICENSE is a self-described scaffold summary (lines 18-21) missing the full CeCILL-2.1 and AGPL-3.0 texts it dual-licenses under; publishing as-is ships an incomplete license. |
+| resolved | licensing | Complete CeCILL-2.1 and AGPL-3.0-or-later texts and the commercial notices now ship under `LICENSES/`. |
 | medium | ci-coverage | pyproject.toml advertises Python 3.11/3.12/3.13 and OS-independent support, but .github/workflows/ci.yml tests only 3.11 on ubuntu-latest — untested support claims. |
 | medium | test-enforcement | No enforced coverage threshold; CI (.github/workflows/ci.yml) runs bare `pytest` with no --cov, so [tool.coverage] config is decorative and regressions in the duckdb/target extra paths (uninstalled in CI) go uncaught. |
 | low | supply-chain | GitHub Actions (actions/checkout@v4, actions/setup-python@v5) pinned to mutable major tags rather than commit SHAs in .github/workflows/ci.yml. |
@@ -73,7 +77,7 @@ nirs4all-tools is a small, well-structured pure-stdlib Python CLI (~4.7k src LOC
 
 ## Quick wins (pragmatic scope — safe to apply now)
 - Add SECURITY.md (point disclosures to nirs4all-admin@cirad.fr, matching ecosystem policy).
-- Replace the placeholder LICENSE with the full canonical CeCILL-2.1 + AGPL-3.0 texts as sibling repos ship them (the file itself flags this as required pre-release).
+- **Resolved:** ship the full canonical CeCILL-2.1 + AGPL-3.0-or-later texts alongside the license summary.
 - Add CHANGELOG.md scaffold (Keep a Changelog) with an Unreleased/0.0.1 entry.
 - Add .editorconfig and a .pre-commit-config.yaml wiring ruff + mypy to match the CI gate.
 - Pin CI actions to commit SHAs (actions/checkout, actions/setup-python) for supply-chain integrity.
@@ -90,7 +94,9 @@ nirs4all-tools is a small, well-structured pure-stdlib Python CLI (~4.7k src LOC
 - Add a build/packaging validation job: `python -m build` + `twine check dist/*` + install-from-wheel smoke test of the `nirs4all-tools` console entry point.
 - Add a tag-triggered PyPI publish workflow using OIDC trusted publishing (no long-lived token), gated on a GitHub Release / version tag, with an environment protection rule.
 - Introduce a docs system (MkDocs+Material or Sphinx+MyST to match ecosystem RTD-ready siblings) documenting the CLI surface, no-in-place/one-way safety model, contract vocabulary, and the migration matrix; wire a docs-build CI check and ReadTheDocs/Pages deploy on tag only.
-- Complete the LICENSE with full canonical texts and add a REUSE/SPDX header pass so `license = CeCILL-2.1 OR AGPL-3.0-or-later` is machine-verifiable.
+- Keep the canonical license texts in package artifacts and add a future
+  REUSE/SPDX header pass so `license = CeCILL-2.1 OR AGPL-3.0-or-later` is
+  machine-verifiable at file level.
 - Add CODE_OF_CONDUCT.md, CITATION.cff, SECURITY.md, CONTRIBUTING.md, and issue/PR templates for a complete community-health set.
 - Add a scorecard/OpenSSF Scorecard workflow and pin all actions by SHA with Dependabot updates.
 - Promote Development Status classifier past Pre-Alpha and bump to a real 0.x release version only after the license, docs, and multi-extra CI land.
