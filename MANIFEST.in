@@ -1,0 +1,2 @@
+include scripts/__init__.py
+include scripts/build_release.py

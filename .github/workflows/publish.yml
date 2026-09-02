@@ -82,7 +82,7 @@ jobs:
       - name: Build sdist + wheel
         run: |
           python -m pip install --upgrade build twine
-          python -m build
+          python scripts/build_release.py
           python -m twine check dist/*
 
       - name: Smoke-check wheel
