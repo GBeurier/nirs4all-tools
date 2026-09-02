@@ -26,7 +26,8 @@ Modified: `.github/workflows/{ci,publish}.yml` (7 action SHA-pins).
 `CI [push]` (ruff + pytest). Verified green post-push. `publish.yml` is release-gated (no publish on push).
 
 ## Residual risks / flags
-- ⛔ **Release blocker:** full CeCILL/AGPL license texts missing (no `LICENSES/` dir) — see `release_checklist.md`.
+- The historical missing-license blocker is closed: complete CeCILL/AGPL texts
+  and commercial-license notices ship under `LICENSES/`; see `release_checklist.md`.
 - A prior `Publish to PyPI [release]` run failed — verify the Trusted Publisher setup before the next tag.
 - No coverage floor yet.
 

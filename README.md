@@ -207,5 +207,7 @@ contract remains observable.
 ## License
 
 Dual-licensed **CeCILL-2.1 OR AGPL-3.0-or-later** (plus commercial), consistent
-with the nirs4all ecosystem policy. See `LICENSE`. Contact:
+with the nirs4all ecosystem policy. See `LICENSE` for the summary and
+`LICENSES/CeCILL-2.1.txt` / `LICENSES/AGPL-3.0-or-later.txt` for the complete
+canonical texts. Contact:
 `nirs4all-admin@cirad.fr`.
