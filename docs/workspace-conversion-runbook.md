@@ -75,8 +75,13 @@ historical verification command and the manifest emitted in the output:
 ## Runtime and rollback boundary
 
 The explicit `engine="legacy"` runtime remains available for its supported
-workflows until after R4. It does not open a DuckDB store through the current
-workspace runtime and does not make conversion implicit.
+workflows through the end of R4. R3 and R4 are the two complete supported
+releases after the R2 native-default flip. The Tools legacy readers follow the
+same minimum window. They may be removed only in a post-V1 release after an
+announced governance decision and migration notice. It does not open a DuckDB
+store through the current workspace runtime and does not make conversion
+implicit. See the [legacy support SLA](legacy-support-sla.md) for the exact
+read/write/migrate dispositions.
 
 There is no R2-to-R1 reverse conversion. To roll back:
 
@@ -87,3 +92,12 @@ There is no R2-to-R1 reverse conversion. To roll back:
 
 This procedure depends on preserving the source, so archive or retention policy
 must cover both the original workspace and the new output.
+
+Use the exact versioned R1 artifact recorded in the release lock, never a
+rolling `latest` URL. Before R2, R3, or R4 is promoted, the release captain must
+record an official versioned URL, checksum, and signature or attestation for
+each rollback version required by
+[`legacy-support-matrix.v1.json`](contracts/legacy-support-matrix.v1.json).
+Those artifacts must remain accessible through the end of R4. The current
+Tools candidate is unpublished, so this local runbook does not claim that the
+external release/archive gate has already passed.

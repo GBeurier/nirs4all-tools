@@ -1,0 +1,127 @@
+{
+  "$schema": "nirs4all-tools.legacy-support-matrix/v1",
+  "schema_version": 1,
+  "status": "candidate_release_hold",
+  "tool_version_line": "0.x",
+  "support_window": "nirs4all-tools 0.x — legacy readers guaranteed through end of R4 (R3 and R4 after the R2 flip); removal only post-V1 by announced decision",
+  "train": {
+    "flip": {"release": "R2", "version": "1.0.0-rc.1"},
+    "guaranteed_reader_releases": [
+      {"release": "R3", "version": "1.0.0-rc.2"},
+      {"release": "R4", "version": "1.0.0"}
+    ],
+    "earliest_removal": "post-V1",
+    "removal_requires": [
+      "announced_governance_decision",
+      "migration_notice_before_effective_release"
+    ]
+  },
+  "service_levels": {
+    "read": {
+      "interfaces": ["workspace inspect", "legacy inspect"],
+      "commitment": "retain each qualified reader and bounded inspection disposition through end of R4"
+    },
+    "write": {
+      "interfaces": ["workspace convert", "legacy migrate"],
+      "commitment": "legacy inputs stay immutable; write only a fresh disjoint nirs4all-workspace-v2 output or an explicitly requested external report"
+    },
+    "migrate": {
+      "interfaces": ["workspace convert", "legacy migrate"],
+      "commitment": "retain each semantic, opaque-preservation, or refusal disposition through end of R4 without implying broader conversion"
+    }
+  },
+  "immutability": {
+    "source_path": "unchanged",
+    "source_inode": "unchanged",
+    "source_bytes": "unchanged",
+    "in_place": "refused",
+    "rename_source": "refused",
+    "bak_copy": "never_created"
+  },
+  "rollback": {
+    "minimum_access_through": "end-of-R4",
+    "versions": [
+      {"release": "R1", "version": "0.13.0", "role": "rollback_from_R2"},
+      {"release": "R2", "version": "1.0.0-rc.1", "role": "rollback_from_R3"},
+      {"release": "R3", "version": "1.0.0-rc.2", "role": "rollback_from_R4"}
+    ],
+    "required_release_lock_evidence": [
+      "official_versioned_url",
+      "sha256",
+      "signature_or_attestation"
+    ],
+    "candidate_availability": "external_release_hold"
+  },
+  "inputs": [
+    {
+      "source_kind": "duckdb-workspace",
+      "legacy_reader": true,
+      "read": "conditional_optional_duckdb",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "semantic_exact_six_table_profile_else_opaque_or_refused"
+    },
+    {
+      "source_kind": "sqlite-workspace-v2",
+      "legacy_reader": false,
+      "read": "qualified",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "already_target_opaque_or_refused"
+    },
+    {
+      "source_kind": "sqlite-workspace-legacy-arrays",
+      "legacy_reader": true,
+      "read": "qualified",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "semantic"
+    },
+    {
+      "source_kind": "fs-runs-v2",
+      "legacy_reader": false,
+      "read": "qualified_detection",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "opaque_or_refused"
+    },
+    {
+      "source_kind": "fs-runs-legacy",
+      "legacy_reader": true,
+      "read": "qualified",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "semantic_single_manifest_preview_else_opaque_or_refused"
+    },
+    {
+      "source_kind": "loose-predictions",
+      "legacy_reader": true,
+      "read": "qualified",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "semantic_complete_single_payload_else_opaque_or_refused"
+    },
+    {
+      "source_kind": "n4a-bundle",
+      "legacy_reader": true,
+      "read": "bounded_structural_only",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "opaque_only_or_refused"
+    },
+    {
+      "source_kind": "n4a-py-bundle",
+      "legacy_reader": true,
+      "read": "opaque_only_never_executed",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "opaque_only_or_refused"
+    },
+    {
+      "source_kind": "native-results-v1",
+      "legacy_reader": false,
+      "read": "qualified_exact_schema_3",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "semantic_exact_schema_3_else_opaque_or_refused"
+    },
+    {
+      "source_kind": "unknown",
+      "legacy_reader": false,
+      "read": "detect_only",
+      "write": "fresh_workspace_v2_only",
+      "migrate": "refused"
+    }
+  ]
+}

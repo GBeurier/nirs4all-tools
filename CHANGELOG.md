@@ -10,6 +10,9 @@ All notable changes to **nirs4all-tools** are documented here. The format follow
 - Add the explicit `workspace inspect` and `workspace convert` user-facing
   aliases expected by the Python transition guidance, while retaining the
   historical `legacy inspect` and `legacy migrate` commands unchanged.
+- Define the V1 legacy read/write/migrate support SLA, including guaranteed
+  reader retention through R3 and R4, immutable inputs, and retained rollback
+  release requirements, in a validated machine-readable support matrix.
 
 ## [0.0.7] — 2026-09-02
 
