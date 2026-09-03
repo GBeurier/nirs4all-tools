@@ -10,6 +10,8 @@ the format the runtime already reads (`nirs4all-workspace-v2`), so users keep
 their predictions/pipelines without the runtime ever opening a legacy store.
 
 > Status: **first transform** (lane `L18`, lock `LOCK-MIG`, decision `DEC-MIG-001`).
+> Candidate packages are **unpublished**; install a wheel supplied through the
+> release process rather than assuming a package-registry version exists.
 > The CLI surface, the no-in-place safety machinery, detection, the contract
 > vocabulary, `inspect`, `migrate --dry-run`, and `--copy-only` are implemented.
 > The first schema transform lowers `sqlite-workspace-legacy-arrays` metadata
@@ -53,6 +55,9 @@ pip install -e ".[trusted-joblib,n4mm-export]" # opt-in trusted PLS -> PREDICT-o
 ```
 
 ## CLI
+
+For an operator procedure that needs no source checkout, including the R2 to R1
+rollback path, see [Workspace conversion runbook](docs/workspace-conversion-runbook.md).
 
 ```bash
 nirs4all-tools --version
