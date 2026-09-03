@@ -93,7 +93,10 @@ from .policy import (
 from .workspace_v2 import WORKSPACE_V2_TABLES, create_workspace_v2_schema
 
 #: Declared legacy-reader support window, recorded into every manifest.
-SUPPORT_WINDOW = "nirs4all-tools 0.x — legacy readers supported for an announced number of releases (TOOL-011)"
+SUPPORT_WINDOW = (
+    "nirs4all-tools 0.x — legacy readers guaranteed through end of R4 "
+    "(R3 and R4 after the R2 flip); removal only post-V1 by announced decision"
+)
 
 _PAYLOAD_DIRNAME = "payload"
 _PRESERVED_DIRNAME = "preserved"

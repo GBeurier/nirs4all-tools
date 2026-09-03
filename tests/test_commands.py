@@ -295,6 +295,7 @@ def test_migrate_manifest_records_source_fingerprint(sqlite_v2_workspace: Path, 
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["source"]["fingerprint"].startswith("sha256:")
+    assert payload["tool"]["support_window"] == commands.SUPPORT_WINDOW
 
 
 def test_migrate_dry_run_refuses_manifest_inside_source(sqlite_v2_workspace: Path, tmp_path: Path) -> None:

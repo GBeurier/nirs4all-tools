@@ -58,6 +58,9 @@ pip install -e ".[trusted-joblib,n4mm-export]" # opt-in trusted PLS -> PREDICT-o
 
 For an operator procedure that needs no source checkout, including the R2 to R1
 rollback path, see [Workspace conversion runbook](docs/workspace-conversion-runbook.md).
+The version-based read/write/migrate commitment and exact per-input dispositions
+are defined by the [legacy support SLA](docs/legacy-support-sla.md) and its
+[machine-readable matrix](docs/contracts/legacy-support-matrix.v1.json).
 
 ```bash
 nirs4all-tools --version
