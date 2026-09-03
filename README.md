@@ -58,9 +58,13 @@ pip install -e ".[trusted-joblib,n4mm-export]" # opt-in trusted PLS -> PREDICT-o
 nirs4all-tools --version
 
 # Read-only: detect what a legacy location contains.
-nirs4all-tools legacy inspect <input> [--format json|text] [--report PATH]
+nirs4all-tools workspace inspect INPUT [--format json|text] [--report PATH]
 
-# Convert into a fresh output (one-way, no-in-place).
+# Convert into a fresh workspace-v2 output (one-way, no-in-place).
+nirs4all-tools workspace convert INPUT --output OUTPUT [--dry-run | --verify]
+
+# Historical/advanced interface, retained unchanged.
+nirs4all-tools legacy inspect <input> [--format json|text] [--report PATH]
 nirs4all-tools legacy migrate <input> --output DIR --target nirs4all-workspace-v2 \
     [--manifest PATH] [--report PATH] [--id-map PATH] [--unsupported-report PATH] \
     [--checksums sha256] [--dry-run | --verify] [--strict | --best-effort] \
@@ -73,6 +77,13 @@ nirs4all-tools legacy verify <output-dir> --manifest PATH [--report PATH]
 # workspace or archive.  joblib is deserialized only with this explicit flag.
 nirs4all-tools legacy export-n4mm <trusted-pls.joblib> --output DIR --trusted-load-joblib
 ```
+
+`workspace inspect` is read-only. `workspace convert` fixes the target to
+`nirs4all-workspace-v2` and returns the same stable domain codes as the
+historical converter: `0` for a clean conversion, `10` when unsupported items
+are preserved opaque in best-effort mode, and `20` when unsupported input is
+refused in strict mode. Both commands leave the source path, inode, and bytes
+untouched; they never rename it or create a `.bak` copy.
 
 Current schema-transform support is intentionally narrow:
 
