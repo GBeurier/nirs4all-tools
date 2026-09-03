@@ -2,6 +2,8 @@
 
 ```
 nirs4all-tools --version
+nirs4all-tools workspace inspect <input> [--format json|text] [--report PATH]
+nirs4all-tools workspace convert <input> --output DIR [--dry-run | --verify]
 nirs4all-tools legacy inspect <input> [--format json|text] [--report PATH]
 nirs4all-tools legacy migrate <input> --output DIR --target nirs4all-workspace-v2
                                       [--manifest PATH] [--report PATH] [--id-map PATH]
@@ -67,55 +69,51 @@ def _cmd_export_n4mm(args: argparse.Namespace) -> ExitCode:
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Construct the full argument parser."""
-    parser = argparse.ArgumentParser(
-        prog="nirs4all-tools",
-        description="Offline, one-way, no-in-place migration tools for legacy nirs4all artifacts.",
-    )
-    parser.add_argument("--version", action="version", version=f"nirs4all-tools {__version__}")
-
-    groups = parser.add_subparsers(dest="group")
-    legacy = groups.add_parser("legacy", help="legacy artifact conversion tools")
-    legacy_cmds = legacy.add_subparsers(dest="command")
-
-    insp = legacy_cmds.add_parser("inspect", help="read-only detection of a legacy source")
-    insp.add_argument("input", type=Path, help="legacy workspace directory or bundle file")
-    insp.add_argument("--format", choices=["json", "text"], default="json", help="output format")
-    insp.add_argument(
+def _configure_inspect_parser(parser: argparse.ArgumentParser) -> None:
+    """Attach the shared read-only inspection arguments to one command."""
+    parser.add_argument("input", type=Path, help="legacy workspace directory or bundle file")
+    parser.add_argument("--format", choices=["json", "text"], default="json", help="output format")
+    parser.add_argument(
         "--report", type=Path, default=None, help="write the inspection document to PATH (outside the source)"
     )
-    insp.set_defaults(func=_cmd_inspect)
+    parser.set_defaults(func=_cmd_inspect)
 
-    mig = legacy_cmds.add_parser("migrate", help="convert a legacy source into a fresh output (no-in-place)")
-    mig.add_argument("input", type=Path, help="legacy workspace directory or bundle file (read-only)")
-    mig.add_argument("--output", type=Path, required=True, help="fresh output directory (must be disjoint from input)")
-    mig.add_argument(
-        "--target",
-        choices=[vocab.TARGET_WORKSPACE_V2, vocab.TARGET_NATIVE_RESULTS_V1],
-        default=vocab.TARGET_WORKSPACE_V2,
-        help="target schema (native-results-v1 is Phase-2, gated)",
+
+def _configure_conversion_parser(parser: argparse.ArgumentParser, *, expose_target: bool) -> None:
+    """Attach shared conversion arguments without changing historical behavior."""
+    parser.add_argument("input", type=Path, help="legacy workspace directory or bundle file (read-only)")
+    parser.add_argument(
+        "--output", type=Path, required=True, help="fresh output directory (must be disjoint from input)"
     )
-    mig.add_argument(
+    if expose_target:
+        parser.add_argument(
+            "--target",
+            choices=[vocab.TARGET_WORKSPACE_V2, vocab.TARGET_NATIVE_RESULTS_V1],
+            default=vocab.TARGET_WORKSPACE_V2,
+            help="target schema (native-results-v1 is Phase-2, gated)",
+        )
+    else:
+        parser.set_defaults(target=vocab.TARGET_WORKSPACE_V2)
+    parser.add_argument(
         "--manifest",
         type=Path,
         default=None,
         help="manifest path (default: <output>/migration-manifest.json; custom path must be outside --output)",
     )
-    mig.add_argument(
+    parser.add_argument(
         "--report",
         type=Path,
         default=None,
         help="report path (default: <output>/migration-report.json; custom path must be outside --output)",
     )
-    mig.add_argument(
+    parser.add_argument(
         "--id-map",
         dest="id_map",
         type=Path,
         default=None,
         help="id-map path (default: <output>/migration-id-map.json; custom path must be outside --output)",
     )
-    mig.add_argument(
+    parser.add_argument(
         "--unsupported-report",
         dest="unsupported_report",
         type=Path,
@@ -125,33 +123,62 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: <output>/unsupported-report.json; custom path is external)"
         ),
     )
-    mig.add_argument("--checksums", choices=["sha256"], default="sha256", help="checksum algorithm")
-    mode = mig.add_mutually_exclusive_group()
+    parser.add_argument("--checksums", choices=["sha256"], default="sha256", help="checksum algorithm")
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="dry_run", action="store_true", help="detect + simulate; write no output store")
     mode.add_argument("--verify", action="store_true", help="migrate, then fully verify the output")
-    effort = mig.add_mutually_exclusive_group()
+    effort = parser.add_mutually_exclusive_group()
     effort.add_argument("--strict", action="store_true", help="abort on the first unsupported item")
     effort.add_argument(
         "--best-effort", dest="best_effort", action="store_true", help="preserve unsupported items opaque (default)"
     )
-    mig.add_argument(
+    parser.add_argument(
         "--copy-only",
         dest="copy_only",
         action="store_true",
         help="faithful checksummed copy for portable source names; no schema transform",
     )
-    mig.add_argument(
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="read-only no-op for one complete, internally verified prior migration (never crash recovery)",
     )
-    mig.add_argument(
+    parser.add_argument(
         "--trusted-load-joblib",
         dest="trusted_load_joblib",
         action="store_true",
         help="opt-in to loading trusted joblib artifacts",
     )
-    mig.set_defaults(func=_cmd_migrate)
+    parser.set_defaults(func=_cmd_migrate)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the full argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="nirs4all-tools",
+        description="Offline, one-way, no-in-place migration tools for legacy nirs4all artifacts.",
+    )
+    parser.add_argument("--version", action="version", version=f"nirs4all-tools {__version__}")
+
+    groups = parser.add_subparsers(dest="group")
+
+    workspace = groups.add_parser("workspace", help="explicit workspace inspection and conversion")
+    workspace_cmds = workspace.add_subparsers(dest="command")
+    workspace_inspect = workspace_cmds.add_parser("inspect", help="read-only detection of a workspace source")
+    _configure_inspect_parser(workspace_inspect)
+    workspace_convert = workspace_cmds.add_parser(
+        "convert", help="convert a workspace source into a fresh workspace-v2 output (no-in-place)"
+    )
+    _configure_conversion_parser(workspace_convert, expose_target=False)
+
+    legacy = groups.add_parser("legacy", help="legacy artifact conversion tools")
+    legacy_cmds = legacy.add_subparsers(dest="command")
+
+    insp = legacy_cmds.add_parser("inspect", help="read-only detection of a legacy source")
+    _configure_inspect_parser(insp)
+
+    mig = legacy_cmds.add_parser("migrate", help="convert a legacy source into a fresh output (no-in-place)")
+    _configure_conversion_parser(mig, expose_target=True)
 
     n4mm = legacy_cmds.add_parser(
         "export-n4mm",

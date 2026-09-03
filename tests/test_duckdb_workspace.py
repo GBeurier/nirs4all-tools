@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from nirs4all_tools import commands, vocab
+from nirs4all_tools.cli import main
 from nirs4all_tools.errors import UnsupportedInput
 from nirs4all_tools.exit_codes import ExitCode
 
@@ -350,6 +351,84 @@ def _strict_migrate(source: Path, output: Path) -> ExitCode:
         verify=True,
         tool_version="0.0.test",
     )
+
+
+def _source_identity(source: Path) -> tuple[Path, int, int, int, int, bytes]:
+    """Capture stable directory/file identities plus the DuckDB bytes."""
+    store = source / "store.duckdb"
+    source_stat = source.stat()
+    store_stat = store.stat()
+    return (
+        source.resolve(),
+        source_stat.st_dev,
+        source_stat.st_ino,
+        store_stat.st_dev,
+        store_stat.st_ino,
+        store.read_bytes(),
+    )
+
+
+def _assert_source_identity(source: Path, expected: tuple[Path, int, int, int, int, bytes]) -> None:
+    """Assert that a CLI operation did not rename or replace its source."""
+    assert _source_identity(source) == expected
+    assert not any(path.name.endswith(".bak") for path in source.parent.rglob("*"))
+
+
+def test_workspace_cli_duckdb_contract_codes_and_source_identity(tmp_path: Path) -> None:
+    """The public workspace aliases preserve source path, inode, and bytes."""
+    clean = _create_closed_duckdb_workspace(tmp_path / "clean")
+    clean_identity = _source_identity(clean)
+
+    assert main(["workspace", "inspect", str(clean)]) == int(ExitCode.SUCCESS)
+    _assert_source_identity(clean, clean_identity)
+
+    legacy_dry_output = tmp_path / "legacy-dry-output"
+    assert main(
+        [
+            "legacy",
+            "migrate",
+            str(clean),
+            "--output",
+            str(legacy_dry_output),
+            "--target",
+            vocab.TARGET_WORKSPACE_V2,
+            "--dry-run",
+        ]
+    ) == int(ExitCode.SUCCESS)
+    assert not legacy_dry_output.exists()
+    _assert_source_identity(clean, clean_identity)
+
+    dry_output = tmp_path / "dry-output"
+    assert main(["workspace", "convert", str(clean), "--output", str(dry_output), "--dry-run"]) == int(
+        ExitCode.SUCCESS
+    )
+    assert not dry_output.exists()
+    _assert_source_identity(clean, clean_identity)
+
+    output = tmp_path / "output"
+    assert main(["workspace", "convert", str(clean), "--output", str(output), "--verify"]) == int(
+        ExitCode.SUCCESS
+    )
+    _assert_source_identity(clean, clean_identity)
+
+    preserved = _create_closed_duckdb_workspace(tmp_path / "preserved")
+    (preserved / "legacy-notes.txt").write_text("outside the closed profile", encoding="utf-8")
+    preserved_identity = _source_identity(preserved)
+    preserved_output = tmp_path / "preserved-output"
+    assert main(["workspace", "convert", str(preserved), "--output", str(preserved_output)]) == int(
+        ExitCode.MIGRATED_WITH_WARNINGS
+    )
+    _assert_source_identity(preserved, preserved_identity)
+
+    refused = _create_closed_duckdb_workspace(tmp_path / "refused")
+    (refused / "legacy-notes.txt").write_text("outside the closed profile", encoding="utf-8")
+    refused_identity = _source_identity(refused)
+    refused_output = tmp_path / "refused-output"
+    assert main(
+        ["workspace", "convert", str(refused), "--output", str(refused_output), "--strict"]
+    ) == int(ExitCode.UNSUPPORTED_INPUT)
+    assert not refused_output.exists()
+    _assert_source_identity(refused, refused_identity)
 
 
 def test_strict_duckdb_workspace_lowers_closed_profile_and_preserves_source(tmp_path: Path) -> None:
