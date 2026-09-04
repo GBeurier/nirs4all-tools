@@ -132,6 +132,13 @@ def validate_matrix(document: dict[str, Any], *, root: Path = ROOT) -> list[str]
         errors.append("matrix must remain candidate_release_hold until external publication evidence exists")
     if document.get("tool_version_line") != "0.x":
         errors.append("tool_version_line must be 0.x")
+    if document.get("distribution") != {
+        "package": "nirs4all-tools",
+        "published_version": "0.0.7",
+        "install": "python -m pip install nirs4all-tools==0.0.7",
+        "product_v1_promotion": "release_hold",
+    }:
+        errors.append("distribution must identify published nirs4all-tools 0.0.7 without claiming V1 promotion")
     if document.get("support_window") != EXPECTED_SUPPORT_WINDOW:
         errors.append("support_window does not guarantee R3 and R4 after the R2 flip")
 
@@ -179,7 +186,7 @@ def validate_matrix(document: dict[str, Any], *, root: Path = ROOT) -> list[str]
         ]:
             errors.append("rollback evidence must require official URL, SHA-256, and signature/attestation")
         if rollback.get("candidate_availability") != "external_release_hold":
-            errors.append("unpublished candidate must retain the external release hold")
+            errors.append("rollback release receipts must retain the external release hold")
 
     inputs = document.get("inputs")
     if not isinstance(inputs, list):
@@ -222,8 +229,8 @@ def validate_matrix(document: dict[str, Any], *, root: Path = ROOT) -> list[str]
     sla = (root / "docs" / "legacy-support-sla.md").read_text(encoding="utf-8")
     runbook = (root / "docs" / "workspace-conversion-runbook.md").read_text(encoding="utf-8")
     readme = (root / "README.md").read_text(encoding="utf-8")
-    if "legacy-support-matrix.v1.json" not in sla or "external release gate" not in sla:
-        errors.append("SLA documentation must link the matrix and retain the external release hold")
+    if "legacy-support-matrix.v1.json" not in sla or "V1 promotion gate" not in sla:
+        errors.append("SLA documentation must link the matrix and retain the V1 promotion hold")
     if "official versioned URL" not in runbook or "through the end of R4" not in runbook:
         errors.append("runbook must require versioned rollback artifacts through end of R4")
     if "docs/contracts/legacy-support-matrix.v1.json" not in readme:
