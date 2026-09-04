@@ -10,8 +10,9 @@ the format the runtime already reads (`nirs4all-workspace-v2`), so users keep
 their predictions/pipelines without the runtime ever opening a legacy store.
 
 > Status: **first transform** (lane `L18`, lock `LOCK-MIG`, decision `DEC-MIG-001`).
-> Candidate packages are **unpublished**; install a wheel supplied through the
-> release process rather than assuming a package-registry version exists.
+> `nirs4all-tools` 0.0.7 is published. Install that exact release for the V1
+> support matrix; this component publication does not by itself promote the
+> nirs4all V1 product train.
 > The CLI surface, the no-in-place safety machinery, detection, the contract
 > vocabulary, `inspect`, `migrate --dry-run`, and `--copy-only` are implemented.
 > The first schema transform lowers `sqlite-workspace-legacy-arrays` metadata

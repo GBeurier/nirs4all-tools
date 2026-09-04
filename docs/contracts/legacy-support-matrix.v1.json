@@ -3,6 +3,12 @@
   "schema_version": 1,
   "status": "candidate_release_hold",
   "tool_version_line": "0.x",
+  "distribution": {
+    "package": "nirs4all-tools",
+    "published_version": "0.0.7",
+    "install": "python -m pip install nirs4all-tools==0.0.7",
+    "product_v1_promotion": "release_hold"
+  },
   "support_window": "nirs4all-tools 0.x — legacy readers guaranteed through end of R4 (R3 and R4 after the R2 flip); removal only post-V1 by announced decision",
   "train": {
     "flip": {"release": "R2", "version": "1.0.0-rc.1"},
