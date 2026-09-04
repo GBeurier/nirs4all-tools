@@ -4,29 +4,30 @@ This runbook converts a supported legacy nirs4all workspace into a separate
 `nirs4all-workspace-v2` output. It uses only an installed console command; a
 source checkout is not required.
 
-The `nirs4all-tools` packages covered here are candidate artifacts and are
-currently **unpublished**. Obtain the candidate wheel through the release
-process. Do not substitute an unverified package-registry version.
+This runbook targets the published `nirs4all-tools` 0.0.7 distribution. Its
+publication makes the standalone converter installable; it does not mean the
+nirs4all V1 product train has been promoted.
 
-## 1. Install the supplied candidate
+## 1. Install the supported Tools release
 
 Use an isolated Python 3.11 or newer environment. DuckDB workspace conversion
 also needs the `duckdb` and `parquet` extras:
 
 ```bash
-python -m venv /opt/nirs4all-tools-candidate
-/opt/nirs4all-tools-candidate/bin/python -m pip install \
-  "./nirs4all_tools-<candidate>-py3-none-any.whl[duckdb,parquet]"
-/opt/nirs4all-tools-candidate/bin/nirs4all-tools --version
+python -m venv /opt/nirs4all-tools-0.0.7
+/opt/nirs4all-tools-0.0.7/bin/python -m pip install \
+  "nirs4all-tools[duckdb,parquet]==0.0.7"
+/opt/nirs4all-tools-0.0.7/bin/nirs4all-tools --version
 ```
 
-Verify the wheel by the signed-artifact procedure supplied with the release
-before installation. No public download URL is defined by this runbook.
+For a controlled deployment, verify the installed artifact against the release
+receipt selected by your organization. The final nirs4all V1 lock remains the
+authority for product-train artifact identities.
 
 ## 2. Inspect without changing the source
 
 ```bash
-/opt/nirs4all-tools-candidate/bin/nirs4all-tools workspace inspect \
+/opt/nirs4all-tools-0.0.7/bin/nirs4all-tools workspace inspect \
   /data/workspace --format text
 ```
 
@@ -40,7 +41,7 @@ Choose an output outside and disjoint from the source. It must not already
 contain data.
 
 ```bash
-/opt/nirs4all-tools-candidate/bin/nirs4all-tools workspace convert \
+/opt/nirs4all-tools-0.0.7/bin/nirs4all-tools workspace convert \
   /data/workspace --output /data/workspace-r2 --verify
 ```
 
@@ -67,7 +68,7 @@ verify the completed output later without reading the source, use the installed
 historical verification command and the manifest emitted in the output:
 
 ```bash
-/opt/nirs4all-tools-candidate/bin/nirs4all-tools legacy verify \
+/opt/nirs4all-tools-0.0.7/bin/nirs4all-tools legacy verify \
   /data/workspace-r2 \
   --manifest /data/workspace-r2/migration-manifest.json
 ```
@@ -98,6 +99,6 @@ rolling `latest` URL. Before R2, R3, or R4 is promoted, the release captain must
 record an official versioned URL, checksum, and signature or attestation for
 each rollback version required by
 [`legacy-support-matrix.v1.json`](contracts/legacy-support-matrix.v1.json).
-Those artifacts must remain accessible through the end of R4. The current
-Tools candidate is unpublished, so this local runbook does not claim that the
-external release/archive gate has already passed.
+Those artifacts must remain accessible through the end of R4. Tools 0.0.7 is
+published, but this runbook does not claim that the final product lock,
+signature or rollback-receipt gates have already passed.

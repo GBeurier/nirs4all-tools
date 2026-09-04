@@ -39,9 +39,10 @@ record, in the release lock, the official versioned URL, SHA-256, and signature
 or attestation for each applicable rollback release. A mutable `latest` URL is
 not evidence.
 
-This repository currently holds an unpublished candidate. The retention rule
-is locally specified and validated, but registry/archive accessibility remains
-an external release gate until those exact artifacts and URLs exist.
+`nirs4all-tools` 0.0.7 is published and is the supported Tools distribution for
+this matrix. That component publication does not promote the nirs4all V1
+product train: the final lock must still bind the rollback URLs, checksums and
+signatures or attestations before the V1 promotion gate can close.
 
 ## Validate
 
