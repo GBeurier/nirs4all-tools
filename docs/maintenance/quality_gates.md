@@ -31,5 +31,6 @@ mismatch before producing the artifact-bound CycloneDX SBOM.
   AGPL-3.0-or-later texts plus commercial notices ship under `LICENSES/`.
 - External Trusted Publisher/OIDC configuration still requires verification on
   the exact release tag; it cannot be proven by repository-local tests.
-- Consider fuzzing the untrusted-input parsers (SQLite/ZIP/JSON/YAML) given the migration threat model.
+- Cover representative invalid SQLite, ZIP, JSON, and YAML inputs with functional
+  non-crash tests; refusals must remain explicit and actionable (`ROB-001`).
 - No enforced coverage floor yet (`pytest-cov` is available).
