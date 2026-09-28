@@ -216,7 +216,7 @@ def _print_error(exc: ToolError) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point: parse args, dispatch, map :class:`ToolError` to exit codes."""
+    """Entry point: parse args and map command failures to stable exit codes."""
     parser = build_parser()
     args = parser.parse_args(argv)
     func = getattr(args, "func", None)
@@ -228,6 +228,15 @@ def main(argv: list[str] | None = None) -> int:
     except ToolError as exc:
         _print_error(exc)
         return int(exc.exit_code)
+    except Exception as exc:
+        _print_error(
+            ToolError(
+                f"internal command error: {exc}",
+                cause=vocab.CAUSE_RUNTIME_ERROR,
+                mitigation="check the filesystem and retry; report the error if it persists",
+            )
+        )
+        return int(ExitCode.INTERNAL_ERROR)
     return int(code)
 
 
