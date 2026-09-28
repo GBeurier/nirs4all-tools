@@ -69,6 +69,26 @@ def test_migrate_native_target_returns_twenty(sqlite_v2_workspace: Path, tmp_pat
     assert code == int(ExitCode.UNSUPPORTED_INPUT)
 
 
+def test_unexpected_command_error_returns_structured_seventy(
+    sqlite_v2_workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def disk_full(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("nirs4all_tools.cli.commands.migrate", disk_full)
+    output = tmp_path / "out"
+    code = main(["legacy", "migrate", str(sqlite_v2_workspace), "--output", str(output)])
+    assert code == int(ExitCode.INTERNAL_ERROR)
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["error"]["exit_code"] == 70
+    assert payload["error"]["cause"] == "runtime_error"
+    assert "disk full" in payload["error"]["message"]
+    assert not output.exists()
+
+
 def test_export_n4mm_requires_explicit_trusted_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     source = tmp_path / "trusted.joblib"
     source.write_bytes(b"never opened")
