@@ -55,6 +55,12 @@ an archive capable of predicting new samples. Inspect the conversion report and
 model-artifact disposition before attempting model replay; a successful
 conversion exit code alone does not establish `load_session()` or `predict()`
 support for that source profile.
+For a converted workspace directory, public `nirs4all.predict(model=output, ...)`
+now refuses both the default DAG-ML and explicit legacy engines with
+`converted_workspace_has_no_fitted_model`. Supply a separately qualified fitted
+`.n4a` archive, or retrain a pipeline before predicting new samples. The
+synthetic legacy save fixture tests this refusal; it does not prove that opaque
+preserved model bundles are replayable.
 
 The workspace conversion domain codes are:
 
