@@ -631,6 +631,37 @@ def test_convert_legacy_save(
     assert workspace["parity"]["status"] == "passed"
 
 
+@pytest.mark.parametrize("engine", ["dag-ml", "legacy"])
+def test_converted_workspace_refuses_new_prediction_without_fitted_model(
+    artifacts_dir: Path,
+    artifacts_dir_explicit: bool,
+    tmp_path: Path,
+    engine: str,
+) -> None:
+    refs = _require_nirs4all_reference(artifacts_dir_explicit)
+    state = _materialize_converted_state(
+        artifacts_dir=artifacts_dir,
+        artifacts_dir_explicit=artifacts_dir_explicit,
+        tmp_path=tmp_path,
+    )
+
+    from nirs4all.pipeline.dagml.rt import RtError
+
+    with pytest.raises(RtError) as failure:
+        refs["nirs4all"].predict(
+            model=state["output"],
+            data=refs["np"].ones((2, 2)),
+            engine=engine,
+        )
+    assert failure.value.to_dict() == {
+        "verb": "predict",
+        "cause": "unsupported_capability",
+        "message": "a converted workspace does not expose a fitted model for new samples",
+        "mitigation": "supply a fitted .n4a archive or retrain a pipeline before predicting new samples",
+        "unsupported_capability": "converted_workspace_has_no_fitted_model",
+    }
+
+
 def test_python_rerun_converted_pipeline(
     artifacts_dir: Path,
     artifacts_dir_explicit: bool,
