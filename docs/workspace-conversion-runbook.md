@@ -49,6 +49,13 @@ The source path, inode, and bytes remain intact. The command never renames the
 source, never writes into it, and never creates a `.bak` copy. Keep the original
 source and the new native output as separate assets.
 
+Conversion of stored prediction results does not synthesize a fitted model.
+The workspace-v2 output can retain results and pipeline metadata while lacking
+an archive capable of predicting new samples. Inspect the conversion report and
+model-artifact disposition before attempting model replay; a successful
+conversion exit code alone does not establish `load_session()` or `predict()`
+support for that source profile.
+
 The workspace conversion domain codes are:
 
 | Code | Operator meaning |
