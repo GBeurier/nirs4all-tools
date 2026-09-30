@@ -6,13 +6,18 @@ All notable changes to **nirs4all-tools** are documented here. The format follow
 
 ## Unreleased
 
-### Added
-- Add the explicit `workspace inspect` and `workspace convert` user-facing
-  aliases expected by the Python transition guidance, while retaining the
-  historical `legacy inspect` and `legacy migrate` commands unchanged.
-- Define the V1 legacy read/write/migrate support SLA, including guaranteed
-  reader retention through R3 and R4, immutable inputs, and retained rollback
-  release requirements, in a validated machine-readable support matrix.
+## [0.0.8] — 2026-09-30
+
+### Fixed
+- Return structured CLI errors for unexpected failures instead of leaking a
+  traceback; qualify converted-workspace prediction refusal and document the
+  boundary between result conversion and fitted-model replay.
+- Keep the V1 legacy-support metadata aligned with published Tools and run CI
+  tests through the selected Python interpreter.
+
+### Maintenance
+- Archive obsolete planning documents into the consolidated ecosystem backlog.
+
 
 ## [0.0.7] — 2026-09-02
 
