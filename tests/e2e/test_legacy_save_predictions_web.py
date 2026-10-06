@@ -755,8 +755,21 @@ def test_python_rerun_converted_pipeline(
         refit=True,
         workspace_path=artifacts_dir / "python-rerun-workspace",
     )
-    rerun_prediction = result.final or result.best
-    assert rerun_prediction is not None
+    # Selection summaries need not contain arrays, and this full-training
+    # refit has no holdout selection score. Reopen its persisted arrays through
+    # the public workspace API, requiring the fixture's sole final model.
+    from nirs4all.data.predictions import Predictions
+
+    try:
+        with Predictions.from_workspace(artifacts_dir / "python-rerun-workspace", load_arrays=True) as stored:
+            final_predictions = stored.filter_predictions(fold_id="final", load_arrays=True)
+            assert len(final_predictions) == 1
+            rerun_prediction = final_predictions[0]
+    finally:
+        result.close()
+    assert rerun_prediction["model_name"] == prediction["model_name"]
+    assert rerun_prediction["model_classname"] == prediction["model_class"].rsplit(".", 1)[-1]
+    assert rerun_prediction["sample_indices"] == list(range(y.size))
     rerun_y_pred = np.asarray(rerun_prediction["y_pred"], dtype=float).reshape(-1)
     rerun_y_true = np.asarray(rerun_prediction["y_true"], dtype=float).reshape(-1)
     assert rerun_y_pred.shape == rerun_y_true.shape
