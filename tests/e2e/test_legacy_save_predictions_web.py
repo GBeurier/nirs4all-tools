@@ -769,6 +769,10 @@ def test_python_rerun_converted_pipeline(
         result.close()
     assert rerun_prediction["model_name"] == prediction["model_name"]
     assert rerun_prediction["model_classname"] == prediction["model_class"].rsplit(".", 1)[-1]
+    assert rerun_prediction["partition"] == "train"
+    assert rerun_prediction["refit_context"] == "standalone"
+    assert rerun_prediction["n_samples"] == y.size
+    assert rerun_prediction["n_features"] == x.shape[1]
     assert rerun_prediction["sample_indices"] == list(range(y.size))
     rerun_y_pred = np.asarray(rerun_prediction["y_pred"], dtype=float).reshape(-1)
     rerun_y_true = np.asarray(rerun_prediction["y_true"], dtype=float).reshape(-1)
