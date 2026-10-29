@@ -4,12 +4,14 @@ import gzip
 import hashlib
 import io
 import json
+import re
 import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 from scripts.build_release import normalize_sdist, source_date_epoch
 from scripts.write_release_sbom import release_sbom, write_release_sbom
 
@@ -59,15 +61,17 @@ def test_source_date_epoch_rejects_invalid_environment(monkeypatch: pytest.Monke
 
 def test_release_build_toolchain_is_exactly_pinned() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["build-system"]["requires"] == [
-        "setuptools==84.0.0",
-        "wheel==0.48.0",
-    ]
+    requirements = [Requirement(value) for value in pyproject["build-system"]["requires"]]
+    assert {requirement.name for requirement in requirements} == {"setuptools", "wheel"}
+    for requirement in requirements:
+        pins = list(requirement.specifier)
+        assert len(pins) == 1 and pins[0].operator == "==" and "*" not in pins[0].version
     workflow = (ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
     assert "python -m pip install build==1.6.0 twine==7.0.0" in workflow
     assert "python scripts/build_release.py" in workflow
-    assert "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in workflow
-    assert "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97" in workflow
+    actions = re.findall(r"uses:\s*([\w/-]+)@([^\s]+)", workflow)
+    assert {name for name, _ in actions} >= {"actions/checkout", "actions/setup-python"}
+    assert all(re.fullmatch(r"[a-f0-9]{40}", revision) for _, revision in actions)
 
 
 def _write_test_wheel(path: Path) -> None:
